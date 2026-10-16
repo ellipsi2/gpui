@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# The published manifests depend on each other through crates.io; build the local copies.
+[patch.crates-io]
+gpui = { path = "crates/gpui" }
+gpui-macros = { path = "crates/gpui-macros" }
+gpui_collections = { path = "crates/gpui_collections" }
+gpui_derive_refineable = { path = "crates/gpui_derive_refineable" }
+gpui_http_client = { path = "crates/gpui_http_client" }
+gpui_media = { path = "crates/gpui_media" }
+gpui_perf = { path = "crates/gpui_perf" }
+gpui_refineable = { path = "crates/gpui_refineable" }
+gpui_semantic_version = { path = "crates/gpui_semantic_version" }
+gpui_sum_tree = { path = "crates/gpui_sum_tree" }
+gpui_util = { path = "crates/gpui_util" }
+gpui_util_macros = { path = "crates/gpui_util_macros" }
