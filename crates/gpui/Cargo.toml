@@ -658,6 +658,18 @@ default-features = false
 version = "25.0"
 features = ["wgsl-in"]
 
+[target.'cfg(target_os = "windows")'.dependencies.blade-graphics]
+version = "0.7.0"
+
+[target.'cfg(target_os = "windows")'.dependencies.blade-macros]
+version = "0.3.0"
+
+[target.'cfg(target_os = "windows")'.dependencies.blade-util]
+version = "0.3.0"
+
+[target.'cfg(target_os = "windows")'.dependencies.bytemuck]
+version = "1"
+
 [target.'cfg(target_os = "windows")'.dependencies.flume]
 version = "0.11"
 
@@ -723,6 +735,10 @@ version = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-registry]
 version = "0.5"
+
+[target.'cfg(target_os = "windows")'.build-dependencies.naga]
+version = "25.0"
+features = ["wgsl-in"]
 
 [target.'cfg(target_os = "windows")'.build-dependencies.embed-resource]
 version = "3.0"

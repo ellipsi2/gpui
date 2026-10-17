@@ -1,7 +1,10 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, OnceLock},
+};
 
 use ::util::ResultExt;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use collections::HashMap;
 use itertools::Itertools;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -9,10 +12,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
-        Graphics::{
-            Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, Direct3D11::*, DirectWrite::*,
-            Dxgi::Common::*, Gdi::LOGFONTW,
-        },
+        Graphics::{DirectWrite::*, Gdi::LOGFONTW},
         System::SystemServices::LOCALE_NAME_MAX_LENGTH,
         UI::WindowsAndMessaging::*,
     },
@@ -39,17 +39,6 @@ struct DirectWriteComponent {
     in_memory_loader: IDWriteInMemoryFontFileLoader,
     builder: IDWriteFontSetBuilder1,
     text_renderer: Arc<TextRendererWrapper>,
-
-    gpu_state: GPUState,
-}
-
-struct GPUState {
-    device: ID3D11Device,
-    device_context: ID3D11DeviceContext,
-    sampler: [Option<ID3D11SamplerState>; 1],
-    blend_state: ID3D11BlendState,
-    vertex_shader: ID3D11VertexShader,
-    pixel_shader: ID3D11PixelShader,
 }
 
 struct DirectWriteState {
@@ -70,7 +59,7 @@ struct FontIdentifier {
 }
 
 impl DirectWriteComponent {
-    pub fn new(directx_devices: &DirectXDevices) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         // todo: ideally this would not be a large unsafe block but smaller isolated ones for easier auditing
         unsafe {
             let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -85,106 +74,20 @@ impl DirectWriteComponent {
             let locale = String::from_utf16_lossy(&locale_vec);
             let text_renderer = Arc::new(TextRendererWrapper::new(&locale));
 
-            let gpu_state = GPUState::new(directx_devices)?;
-
             Ok(DirectWriteComponent {
                 locale,
                 factory,
                 in_memory_loader,
                 builder,
                 text_renderer,
-                gpu_state,
             })
         }
     }
 }
 
-impl GPUState {
-    fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        let device = directx_devices.device.clone();
-        let device_context = directx_devices.device_context.clone();
-
-        let blend_state = {
-            let mut blend_state = None;
-            let desc = D3D11_BLEND_DESC {
-                AlphaToCoverageEnable: false.into(),
-                IndependentBlendEnable: false.into(),
-                RenderTarget: [
-                    D3D11_RENDER_TARGET_BLEND_DESC {
-                        BlendEnable: true.into(),
-                        SrcBlend: D3D11_BLEND_ONE,
-                        DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
-                        BlendOp: D3D11_BLEND_OP_ADD,
-                        SrcBlendAlpha: D3D11_BLEND_ONE,
-                        DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
-                        BlendOpAlpha: D3D11_BLEND_OP_ADD,
-                        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
-                    },
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                ],
-            };
-            unsafe { device.CreateBlendState(&desc, Some(&mut blend_state)) }?;
-            blend_state.unwrap()
-        };
-
-        let sampler = {
-            let mut sampler = None;
-            let desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
-                AddressU: D3D11_TEXTURE_ADDRESS_BORDER,
-                AddressV: D3D11_TEXTURE_ADDRESS_BORDER,
-                AddressW: D3D11_TEXTURE_ADDRESS_BORDER,
-                MipLODBias: 0.0,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
-                BorderColor: [0.0, 0.0, 0.0, 0.0],
-                MinLOD: 0.0,
-                MaxLOD: 0.0,
-            };
-            unsafe { device.CreateSamplerState(&desc, Some(&mut sampler)) }?;
-            [sampler]
-        };
-
-        let vertex_shader = {
-            let source = shader_resources::RawShaderBytes::new(
-                shader_resources::ShaderModule::EmojiRasterization,
-                shader_resources::ShaderTarget::Vertex,
-            )?;
-            let mut shader = None;
-            unsafe { device.CreateVertexShader(source.as_bytes(), None, Some(&mut shader)) }?;
-            shader.unwrap()
-        };
-
-        let pixel_shader = {
-            let source = shader_resources::RawShaderBytes::new(
-                shader_resources::ShaderModule::EmojiRasterization,
-                shader_resources::ShaderTarget::Fragment,
-            )?;
-            let mut shader = None;
-            unsafe { device.CreatePixelShader(source.as_bytes(), None, Some(&mut shader)) }?;
-            shader.unwrap()
-        };
-
-        Ok(Self {
-            device,
-            device_context,
-            sampler,
-            blend_state,
-            vertex_shader,
-            pixel_shader,
-        })
-    }
-}
-
 impl DirectWriteTextSystem {
-    pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        let components = DirectWriteComponent::new(directx_devices)?;
+    pub(crate) fn new() -> Result<Self> {
+        let components = DirectWriteComponent::new()?;
         let system_font_collection = unsafe {
             let mut result = std::mem::zeroed();
             components
@@ -211,9 +114,6 @@ impl DirectWriteTextSystem {
         })))
     }
 
-    pub(crate) fn handle_gpu_lost(&self, directx_devices: &DirectXDevices) {
-        self.0.write().handle_gpu_lost(directx_devices);
-    }
 }
 
 impl PlatformTextSystem for DirectWriteTextSystem {
@@ -948,12 +848,11 @@ impl DirectWriteState {
                         }
                     };
                     let bounds = bounds(point(color_bounds.left, color_bounds.top), color_size);
-                    glyph_layers.push(GlyphLayerTexture::new(
-                        &self.components.gpu_state,
+                    glyph_layers.push(GlyphLayer {
                         run_color,
                         bounds,
-                        &alpha_data,
-                    )?);
+                        alpha: alpha_data,
+                    });
                 }
             }
 
@@ -965,195 +864,11 @@ impl DirectWriteState {
             }
         }
 
-        let gpu_state = &self.components.gpu_state;
-        let params_buffer = {
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: std::mem::size_of::<GlyphLayerTextureParams>() as u32,
-                Usage: D3D11_USAGE_DYNAMIC,
-                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                MiscFlags: 0,
-                StructureByteStride: 0,
-            };
-
-            let mut buffer = None;
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateBuffer(&desc, None, Some(&mut buffer))
-            }?;
-            [buffer]
-        };
-
-        let render_target_texture = {
-            let mut texture = None;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: bitmap_size.width.0 as u32,
-                Height: bitmap_size.height.0 as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateTexture2D(&desc, None, Some(&mut texture))
-            }?;
-            texture.unwrap()
-        };
-
-        let render_target_view = {
-            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
-                },
-            };
-            let mut rtv = None;
-            unsafe {
-                gpu_state.device.CreateRenderTargetView(
-                    &render_target_texture,
-                    Some(&desc),
-                    Some(&mut rtv),
-                )
-            }?;
-            [rtv]
-        };
-
-        let staging_texture = {
-            let mut texture = None;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: bitmap_size.width.0 as u32,
-                Height: bitmap_size.height.0 as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateTexture2D(&desc, None, Some(&mut texture))
-            }?;
-            texture.unwrap()
-        };
-
-        let device_context = &gpu_state.device_context;
-        unsafe { device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) };
-        unsafe { device_context.VSSetShader(&gpu_state.vertex_shader, None) };
-        unsafe { device_context.PSSetShader(&gpu_state.pixel_shader, None) };
-        unsafe { device_context.VSSetConstantBuffers(0, Some(&params_buffer)) };
-        unsafe { device_context.PSSetConstantBuffers(0, Some(&params_buffer)) };
-        unsafe { device_context.OMSetRenderTargets(Some(&render_target_view), None) };
-        unsafe { device_context.PSSetSamplers(0, Some(&gpu_state.sampler)) };
-        unsafe { device_context.OMSetBlendState(&gpu_state.blend_state, None, 0xffffffff) };
-
-        let crate::FontInfo {
-            gamma_ratios,
-            grayscale_enhanced_contrast,
-        } = DirectXRenderer::get_font_info();
-
-        for layer in glyph_layers {
-            let params = GlyphLayerTextureParams {
-                run_color: layer.run_color,
-                bounds: layer.bounds,
-                gamma_ratios: *gamma_ratios,
-                grayscale_enhanced_contrast: *grayscale_enhanced_contrast,
-                _pad: [0f32; 3],
-            };
-            unsafe {
-                let mut dest = std::mem::zeroed();
-                gpu_state.device_context.Map(
-                    params_buffer[0].as_ref().unwrap(),
-                    0,
-                    D3D11_MAP_WRITE_DISCARD,
-                    0,
-                    Some(&mut dest),
-                )?;
-                std::ptr::copy_nonoverlapping(&params as *const _, dest.pData as *mut _, 1);
-                gpu_state
-                    .device_context
-                    .Unmap(params_buffer[0].as_ref().unwrap(), 0);
-            };
-
-            let texture = [Some(layer.texture_view)];
-            unsafe { device_context.PSSetShaderResources(0, Some(&texture)) };
-
-            let viewport = [D3D11_VIEWPORT {
-                TopLeftX: layer.bounds.origin.x as f32,
-                TopLeftY: layer.bounds.origin.y as f32,
-                Width: layer.bounds.size.width as f32,
-                Height: layer.bounds.size.height as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            }];
-            unsafe { device_context.RSSetViewports(Some(&viewport)) };
-
-            unsafe { device_context.Draw(4, 0) };
-        }
-
-        unsafe { device_context.CopyResource(&staging_texture, &render_target_texture) };
-
-        let mapped_data = {
-            let mut mapped_data = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe {
-                device_context.Map(
-                    &staging_texture,
-                    0,
-                    D3D11_MAP_READ,
-                    0,
-                    Some(&mut mapped_data),
-                )
-            }?;
-            mapped_data
-        };
-        let mut rasterized =
-            vec![0u8; (bitmap_size.width.0 as u32 * bitmap_size.height.0 as u32 * 4) as usize];
-
-        for y in 0..bitmap_size.height.0 as usize {
-            let width = bitmap_size.width.0 as usize;
-            unsafe {
-                std::ptr::copy_nonoverlapping::<u8>(
-                    (mapped_data.pData as *const u8).byte_add(mapped_data.RowPitch as usize * y),
-                    rasterized
-                        .as_mut_ptr()
-                        .byte_add(width * y * std::mem::size_of::<u32>()),
-                    width * std::mem::size_of::<u32>(),
-                )
-            };
-        }
-
-        // Convert from premultiplied to straight alpha
-        for chunk in rasterized.chunks_exact_mut(4) {
-            let b = chunk[0] as f32;
-            let g = chunk[1] as f32;
-            let r = chunk[2] as f32;
-            let a = chunk[3] as f32;
-            if a > 0.0 {
-                let inv_a = 255.0 / a;
-                chunk[0] = (b * inv_a).clamp(0.0, 255.0) as u8;
-                chunk[1] = (g * inv_a).clamp(0.0, 255.0) as u8;
-                chunk[2] = (r * inv_a).clamp(0.0, 255.0) as u8;
-            }
-        }
-
-        Ok(rasterized)
+        Ok(composite_color_layers(
+            &glyph_layers,
+            bitmap_size.width.0.max(0) as usize,
+            bitmap_size.height.0.max(0) as usize,
+        ))
     }
 
     fn get_typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -1215,19 +930,6 @@ impl DirectWriteState {
         result
     }
 
-    fn handle_gpu_lost(&mut self, directx_devices: &DirectXDevices) {
-        try_to_recover_from_device_lost(
-            || GPUState::new(directx_devices).context("Recreating GPU state for DirectWrite"),
-            |gpu_state| self.components.gpu_state = gpu_state,
-            || {
-                log::error!(
-                    "Failed to recreate GPU state for DirectWrite after multiple attempts."
-                );
-                // Do something here?
-                // At this point, the device loss is considered unrecoverable.
-            },
-        );
-    }
 }
 
 impl Drop for DirectWriteState {
@@ -1241,85 +943,107 @@ impl Drop for DirectWriteState {
     }
 }
 
-struct GlyphLayerTexture {
+/// One COLR layer of a color glyph: its coverage mask over `bounds` (bitmap pixels) and color.
+struct GlyphLayer {
     run_color: Rgba,
     bounds: Bounds<i32>,
-    texture_view: ID3D11ShaderResourceView,
-    // holding on to the texture to not RAII drop it
-    _texture: ID3D11Texture2D,
+    alpha: Vec<u8>,
 }
 
-impl GlyphLayerTexture {
-    pub fn new(
-        gpu_state: &GPUState,
-        run_color: Rgba,
-        bounds: Bounds<i32>,
-        alpha_data: &[u8],
-    ) -> Result<Self> {
-        let texture_size = bounds.size;
-
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: texture_size.width as u32,
-            Height: texture_size.height as u32,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-
-        let texture = {
-            let mut texture: Option<ID3D11Texture2D> = None;
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateTexture2D(&desc, None, Some(&mut texture))?
-            };
-            texture.unwrap()
-        };
-        let texture_view = {
-            let mut view: Option<ID3D11ShaderResourceView> = None;
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateShaderResourceView(&texture, None, Some(&mut view))?
-            };
-            view.unwrap()
-        };
-
-        unsafe {
-            gpu_state.device_context.UpdateSubresource(
-                &texture,
-                0,
-                None,
-                alpha_data.as_ptr() as _,
-                texture_size.width as u32,
-                0,
-            )
-        };
-
-        Ok(GlyphLayerTexture {
-            run_color,
-            bounds,
-            texture_view,
-            _texture: texture,
-        })
+/// Composite color glyph layers back to front into a `width` x `height` straight-alpha BGRA
+/// bitmap. Each layer's coverage gets DirectWrite's contrast and gamma correction for its
+/// color (as the monochrome text shader does), then is drawn over the layers below.
+fn composite_color_layers(layers: &[GlyphLayer], width: usize, height: usize) -> Vec<u8> {
+    let (gamma_ratios, enhanced_contrast) = system_text_gamma_and_contrast();
+    let gamma_ratios = gamma_ratios_for(gamma_ratios);
+    // Premultiplied blue, green, red, alpha per pixel.
+    let mut premultiplied = vec![[0f32; 4]; width * height];
+    for layer in layers {
+        let color = [layer.run_color.b, layer.run_color.g, layer.run_color.r];
+        let brightness = 0.30 * layer.run_color.r + 0.59 * layer.run_color.g + 0.11 * layer.run_color.b;
+        let k = enhanced_contrast * (4.0 * (0.75 - brightness)).clamp(0.0, 1.0);
+        let (layer_width, layer_height) = (layer.bounds.size.width, layer.bounds.size.height);
+        for ly in 0..layer_height {
+            let y = layer.bounds.origin.y + ly;
+            if y < 0 || y as usize >= height {
+                continue;
+            }
+            for lx in 0..layer_width {
+                let x = layer.bounds.origin.x + lx;
+                if x < 0 || x as usize >= width {
+                    continue;
+                }
+                let sample = f32::from(layer.alpha[(ly * layer_width + lx) as usize]) / 255.0;
+                let contrasted = sample * (k + 1.0) / (sample * k + 1.0);
+                let g = gamma_ratios;
+                let correction = (g[0] * brightness + g[1]) * contrasted + (g[2] * brightness + g[3]);
+                let corrected = contrasted + contrasted * (1.0 - contrasted) * correction;
+                let alpha = (corrected * layer.run_color.a).clamp(0.0, 1.0);
+                let dst = &mut premultiplied[y as usize * width + x as usize];
+                for c in 0..3 {
+                    dst[c] = color[c] * alpha + dst[c] * (1.0 - alpha);
+                }
+                dst[3] = alpha + dst[3] * (1.0 - alpha);
+            }
+        }
     }
+    let mut bytes = Vec::with_capacity(width * height * 4);
+    for [b, g, r, a] in premultiplied {
+        let straight = |v: f32| if a > 0.0 { v / a } else { 0.0 };
+        for v in [straight(b), straight(g), straight(r), a] {
+            bytes.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    bytes
 }
 
-#[repr(C)]
-struct GlyphLayerTextureParams {
-    bounds: Bounds<i32>,
-    run_color: Rgba,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    _pad: [f32; 3],
+/// The system's text gamma and grayscale enhanced contrast (DirectWrite rendering params).
+pub(crate) fn system_text_gamma_and_contrast() -> (f32, f32) {
+    static PARAMS: OnceLock<(f32, f32)> = OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        let params = unsafe {
+            DWriteCreateFactory::<IDWriteFactory5>(DWRITE_FACTORY_TYPE_SHARED)
+                .and_then(|factory| factory.CreateRenderingParams())
+                .and_then(|params| params.cast::<IDWriteRenderingParams1>())
+        };
+        match params {
+            Ok(params) => unsafe { (params.GetGamma(), params.GetGrayscaleEnhancedContrast()) },
+            Err(err) => {
+                log::error!("Reading DirectWrite rendering parameters: {err}");
+                (1.8, 1.0)
+            }
+        }
+    })
+}
+
+/// Gamma ratios for brightening/darkening glyph edges at `gamma`, as the text shaders use.
+// https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.cpp#L50
+fn gamma_ratios_for(gamma: f32) -> [f32; 4] {
+    const GAMMA_INCORRECT_TARGET_RATIOS: [[f32; 4]; 13] = [
+        [0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0], // gamma = 1.0
+        [0.0166 / 4.0, -0.0807 / 4.0, 0.2227 / 4.0, -0.0751 / 4.0], // gamma = 1.1
+        [0.0350 / 4.0, -0.1760 / 4.0, 0.4325 / 4.0, -0.1370 / 4.0], // gamma = 1.2
+        [0.0543 / 4.0, -0.2821 / 4.0, 0.6302 / 4.0, -0.1876 / 4.0], // gamma = 1.3
+        [0.0739 / 4.0, -0.3963 / 4.0, 0.8167 / 4.0, -0.2287 / 4.0], // gamma = 1.4
+        [0.0933 / 4.0, -0.5161 / 4.0, 0.9926 / 4.0, -0.2616 / 4.0], // gamma = 1.5
+        [0.1121 / 4.0, -0.6395 / 4.0, 1.1588 / 4.0, -0.2877 / 4.0], // gamma = 1.6
+        [0.1300 / 4.0, -0.7649 / 4.0, 1.3159 / 4.0, -0.3080 / 4.0], // gamma = 1.7
+        [0.1469 / 4.0, -0.8911 / 4.0, 1.4644 / 4.0, -0.3234 / 4.0], // gamma = 1.8
+        [0.1627 / 4.0, -1.0170 / 4.0, 1.6051 / 4.0, -0.3347 / 4.0], // gamma = 1.9
+        [0.1773 / 4.0, -1.1420 / 4.0, 1.7385 / 4.0, -0.3426 / 4.0], // gamma = 2.0
+        [0.1908 / 4.0, -1.2652 / 4.0, 1.8650 / 4.0, -0.3476 / 4.0], // gamma = 2.1
+        [0.2031 / 4.0, -1.3864 / 4.0, 1.9851 / 4.0, -0.3501 / 4.0], // gamma = 2.2
+    ];
+    const NORM13: f32 = ((0x10000 as f64) / (255.0 * 255.0) * 4.0) as f32;
+    const NORM24: f32 = ((0x100 as f64) / (255.0) * 4.0) as f32;
+    let index = ((gamma * 10.0).round() as usize).clamp(10, 22) - 10;
+    let ratios = GAMMA_INCORRECT_TARGET_RATIOS[index];
+    [
+        ratios[0] * NORM13,
+        ratios[1] * NORM24,
+        ratios[2] * NORM13,
+        ratios[3] * NORM24,
+    ]
 }
 
 struct TextRendererWrapper(pub IDWriteTextRenderer);

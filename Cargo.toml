@@ -4,6 +4,7 @@ members = ["crates/*"]
 
 # The published manifests depend on each other through crates.io; build the local copies.
 [patch.crates-io]
+blade-graphics = { path = "crates/blade-graphics" }
 gpui = { path = "crates/gpui" }
 gpui-macros = { path = "crates/gpui-macros" }
 gpui_collections = { path = "crates/gpui_collections" }

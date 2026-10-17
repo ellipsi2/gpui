@@ -26,7 +26,10 @@ use windows::{
     core::*,
 };
 
-use crate::*;
+use crate::{
+    platform::blade::{BladeContext, BladeRenderer},
+    *,
+};
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
@@ -48,7 +51,9 @@ pub struct WindowsWindowState {
     pub system_key_handled: bool,
     pub hovered: bool,
 
-    pub renderer: DirectXRenderer,
+    /// Created once `CreateWindowExW` returns: during creation the client area is empty, and
+    /// Vulkan cannot make a swap chain for it.
+    pub renderer: Option<BladeRenderer>,
 
     pub click_state: ClickState,
     pub current_cursor: Option<HCURSOR>,
@@ -79,13 +84,11 @@ pub(crate) struct WindowsWindowInner {
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
-        directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         display: WindowsDisplay,
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
-        disable_direct_composition: bool,
     ) -> Result<Self> {
         let scale_factor = {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
@@ -105,8 +108,7 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = None;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -209,13 +211,11 @@ impl WindowsWindowInner {
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = RefCell::new(WindowsWindowState::new(
             hwnd,
-            &context.directx_devices,
             cs,
             context.current_cursor,
             context.display,
             context.min_size,
             context.appearance,
-            context.disable_direct_composition,
         )?);
 
         Ok(Rc::new_cyclic(|this| Self {
@@ -354,8 +354,7 @@ struct WindowCreateContext {
     main_receiver: flume::Receiver<Runnable>,
     platform_window_handle: HWND,
     appearance: WindowAppearance,
-    disable_direct_composition: bool,
-    directx_devices: DirectXDevices,
+    gpu_context: BladeContext,
 }
 
 impl WindowsWindow {
@@ -373,8 +372,7 @@ impl WindowsWindow {
             validation_number,
             main_receiver,
             platform_window_handle,
-            disable_direct_composition,
-            directx_devices,
+            gpu_context,
         } = creation_info;
         register_window_class(icon);
         let hide_title_bar = params
@@ -391,7 +389,7 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+        let (dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -406,9 +404,6 @@ impl WindowsWindow {
 
             (WS_EX_APPWINDOW, dwstyle)
         };
-        if !disable_direct_composition {
-            dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
-        }
 
         let hinstance = get_module_handle();
         let display = if let Some(display_id) = params.display_id {
@@ -433,8 +428,7 @@ impl WindowsWindow {
             main_receiver,
             platform_window_handle,
             appearance,
-            disable_direct_composition,
-            directx_devices,
+            gpu_context,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -457,6 +451,18 @@ impl WindowsWindow {
         // so check the inner result first.
         let this = context.inner.take().unwrap()?;
         let hwnd = creation_result?;
+        // The renderer is made now that the window has its initial client size.
+        let client = {
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(hwnd, &mut rect)? };
+            blade_graphics::Extent {
+                width: (rect.right - rect.left).max(1) as u32,
+                height: (rect.bottom - rect.top).max(1) as u32,
+                depth: 1,
+            }
+        };
+        this.state.borrow_mut().renderer =
+            Some(windows_renderer::init(&context.gpu_context, hwnd, client, true)?);
 
         register_drag_drop(&this)?;
         configure_dwm_dark_mode(hwnd, appearance);
@@ -500,6 +506,9 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        if let Some(renderer) = self.0.state.borrow_mut().renderer.as_mut() {
+            renderer.destroy();
+        }
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -757,6 +766,9 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let hwnd = self.0.hwnd;
+        if let Some(renderer) = self.0.state.borrow_mut().renderer.as_mut() {
+            renderer.update_transparency(background_appearance != WindowBackgroundAppearance::Opaque);
+        }
 
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
@@ -842,11 +854,20 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.0.state.borrow_mut().renderer.draw(scene).log_err();
+        if let Some(renderer) = self.0.state.borrow_mut().renderer.as_mut() {
+            renderer.draw(scene);
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.0.state.borrow().renderer.sprite_atlas()
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .as_ref()
+            .expect("renderer is created with the window")
+            .sprite_atlas()
+            .clone()
     }
 
     fn get_raw_handle(&self) -> HWND {
@@ -854,7 +875,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.0.state.borrow().renderer.gpu_specs().log_err()
+        Some(self.0.state.borrow().renderer.as_ref()?.gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -1354,6 +1375,51 @@ fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32
                 cb_data: std::mem::size_of::<AccentPolicy>(),
             };
             let _ = set_window_composition_attribute(hwnd, &mut data as *mut _ as _);
+        }
+    }
+}
+
+mod windows_renderer {
+    use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
+    use raw_window_handle as rwh;
+    use std::num::NonZeroIsize;
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::GWLP_HINSTANCE};
+
+    use crate::{get_window_long, show_error};
+
+    pub(super) fn init(
+        context: &BladeContext,
+        hwnd: HWND,
+        size: blade_graphics::Extent,
+        transparent: bool,
+    ) -> anyhow::Result<BladeRenderer> {
+        let raw = RawWindow { hwnd };
+        let config = BladeSurfaceConfig { size, transparent,
+        };
+        BladeRenderer::new(context, &raw, config)
+            .inspect_err(|err| show_error("Failed to initialize BladeRenderer", err.to_string()))
+    }
+
+    struct RawWindow {
+        hwnd: HWND,
+    }
+
+    impl rwh::HasWindowHandle for RawWindow {
+        fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+            Ok(unsafe {
+                let hwnd = NonZeroIsize::new_unchecked(self.hwnd.0 as isize);
+                let mut handle = rwh::Win32WindowHandle::new(hwnd);
+                let hinstance = get_window_long(self.hwnd, GWLP_HINSTANCE);
+                handle.hinstance = NonZeroIsize::new(hinstance);
+                rwh::WindowHandle::borrow_raw(handle.into())
+            })
+        }
+    }
+
+    impl rwh::HasDisplayHandle for RawWindow {
+        fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
+            let handle = rwh::WindowsDisplayHandle::new();
+            Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
         }
     }
 }

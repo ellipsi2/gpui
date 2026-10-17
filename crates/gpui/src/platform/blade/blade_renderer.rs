@@ -1018,16 +1018,21 @@ impl RenderingParameters {
                     .find(|&n| (context.gpu.capabilities().sample_count_mask & n) != 0)
             })
             .unwrap_or(1);
+        // Windows defaults to the system's DirectWrite text gamma and contrast.
+        #[cfg(target_os = "windows")]
+        let (default_gamma, default_contrast) = crate::system_text_gamma_and_contrast();
+        #[cfg(not(target_os = "windows"))]
+        let (default_gamma, default_contrast) = (1.8_f32, 1.0_f32);
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1.8_f32)
+            .unwrap_or(default_gamma)
             .clamp(1.0, 2.2);
         let gamma_ratios = Self::get_gamma_ratios(gamma);
         let grayscale_enhanced_contrast = env::var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0_f32)
+            .unwrap_or(default_contrast)
             .max(0.0);
 
         Self {

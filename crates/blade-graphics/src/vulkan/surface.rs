@@ -11,8 +11,12 @@ impl super::Surface {
 
     unsafe fn deinit_swapchain(&mut self, raw_device: &ash::Device) {
         let _ = raw_device.device_wait_idle();
-        self.device
-            .destroy_swapchain(mem::take(&mut self.swapchain.raw), None);
+        // Destroying a null swapchain is valid Vulkan, but faults in NVIDIA's Windows driver
+        // (a surface's first configuration has no swapchain yet).
+        let swapchain = mem::take(&mut self.swapchain.raw);
+        if swapchain != vk::SwapchainKHR::null() {
+            self.device.destroy_swapchain(swapchain, None);
+        }
         for frame in self.frames.drain(..) {
             raw_device.destroy_image_view(frame.view, None);
             raw_device.destroy_semaphore(frame.acquire_semaphore, None);
