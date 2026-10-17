@@ -525,6 +525,9 @@ impl MetalRenderer {
                 // Not implemented on Metal: a backdrop blur draws nothing (the Blade renderer
                 // has it).
                 PrimitiveBatch::BackdropBlurs(_) => true,
+                // Not implemented on Metal: line lists draw nothing (the Blade renderer has
+                // them).
+                PrimitiveBatch::LineLists(_) => true,
             };
             if !ok {
                 command_encoder.end_encoding();

@@ -7,16 +7,17 @@ use crate::{
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
-    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    LineLayoutIndex, LineList, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubscriberSet,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextStyle, TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -2886,6 +2887,49 @@ impl Window {
             blur_radius: blur_radius.scale(scale_factor),
             tint,
             opacity,
+        });
+    }
+
+    /// Paint line segments into the scene for the next frame at the current z-index, as
+    /// antialiased lines `width` wide in `color`. Each of `lines` is `[x0, y0, x1, y1]` in its
+    /// own units; a point `p` of them is drawn at `origin + p * scale` (a negative scale flips
+    /// that axis). Only what lies inside `bounds` (and the content mask) shows. The segments
+    /// go to the GPU as they are, so painting many costs no tessellation.
+    ///
+    /// Implemented by the Blade renderer (Windows, Linux, macOS with `macos-blade`); the Metal
+    /// renderer draws nothing for it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_lines(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        lines: Arc<[[f32; 4]]>,
+        origin: Point<Pixels>,
+        scale: [f32; 2],
+        width: Pixels,
+        color: impl Into<Hsla>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if lines.is_empty() {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        let content_mask = ContentMask {
+            bounds: self.content_mask().bounds.intersect(&bounds),
+        };
+        let opacity = self.element_opacity();
+        let mut color = color.into();
+        color.a *= opacity;
+        self.next_frame.scene.insert_primitive(LineList {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            lines,
+            offset: origin.scale(scale_factor),
+            scale: [scale[0] * scale_factor, scale[1] * scale_factor],
+            width: width.scale(scale_factor),
+            color,
         });
     }
 

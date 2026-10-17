@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -33,6 +34,7 @@ pub(crate) struct Scene {
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
     pub(crate) backdrop_blurs: Vec<BackdropBlur>,
+    pub(crate) line_lists: Vec<LineList>,
 }
 
 impl Scene {
@@ -48,6 +50,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.line_lists.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -117,6 +120,10 @@ impl Scene {
                 blur.order = order;
                 self.backdrop_blurs.push(blur.clone());
             }
+            Primitive::LineList(lines) => {
+                lines.order = order;
+                self.line_lists.push(lines.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -143,6 +150,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.line_lists.sort_by_key(|lines| lines.order);
     }
 
     #[cfg_attr(
@@ -178,6 +186,9 @@ impl Scene {
             backdrop_blurs: &self.backdrop_blurs,
             backdrop_blurs_start: 0,
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
+            line_lists: &self.line_lists,
+            line_lists_start: 0,
+            line_lists_iter: self.line_lists.iter().peekable(),
         }
     }
 }
@@ -200,6 +211,7 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     BackdropBlur,
+    LineList,
 }
 
 pub(crate) enum PaintOperation {
@@ -218,6 +230,7 @@ pub(crate) enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     BackdropBlur(BackdropBlur),
+    LineList(LineList),
 }
 
 impl Primitive {
@@ -231,6 +244,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropBlur(blur) => &blur.bounds,
+            Primitive::LineList(lines) => &lines.bounds,
         }
     }
 
@@ -244,6 +258,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropBlur(blur) => &blur.content_mask,
+            Primitive::LineList(lines) => &lines.content_mask,
         }
     }
 }
@@ -280,6 +295,9 @@ struct BatchIterator<'a> {
     backdrop_blurs: &'a [BackdropBlur],
     backdrop_blurs_start: usize,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
+    line_lists: &'a [LineList],
+    line_lists_start: usize,
+    line_lists_iter: Peekable<slice::Iter<'a, LineList>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -312,6 +330,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.backdrop_blurs_iter.peek().map(|b| b.order),
                 PrimitiveKind::BackdropBlur,
+            ),
+            (
+                self.line_lists_iter.peek().map(|l| l.order),
+                PrimitiveKind::LineList,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -459,6 +481,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                     &self.backdrop_blurs[blurs_start..blurs_end],
                 ))
             }
+            PrimitiveKind::LineList => {
+                let lists_start = self.line_lists_start;
+                let mut lists_end = lists_start + 1;
+                self.line_lists_iter.next();
+                while self
+                    .line_lists_iter
+                    .next_if(|lines| (lines.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    lists_end += 1;
+                }
+                self.line_lists_start = lists_end;
+                Some(PrimitiveBatch::LineLists(
+                    &self.line_lists[lists_start..lists_end],
+                ))
+            }
         }
     }
 }
@@ -486,6 +524,7 @@ pub(crate) enum PrimitiveBatch<'a> {
     },
     Surfaces(&'a [PaintSurface]),
     BackdropBlurs(&'a [BackdropBlur]),
+    LineLists(&'a [LineList]),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -765,6 +804,27 @@ pub(crate) struct BackdropBlur {
 impl From<BackdropBlur> for Primitive {
     fn from(blur: BackdropBlur) -> Self {
         Primitive::BackdropBlur(blur)
+    }
+}
+
+/// Antialiased line segments of one width and color. Each of `lines` is `[x0, y0, x1, y1]` in
+/// its own units; a point `p` of them is drawn at `offset + p * scale`. Renderers without it
+/// draw nothing for it.
+#[derive(Clone, Debug)]
+pub(crate) struct LineList {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub lines: Arc<[[f32; 4]]>,
+    pub offset: Point<ScaledPixels>,
+    pub scale: [f32; 2],
+    pub width: ScaledPixels,
+    pub color: Hsla,
+}
+
+impl From<LineList> for Primitive {
+    fn from(lines: LineList) -> Self {
+        Primitive::LineList(lines)
     }
 }
 

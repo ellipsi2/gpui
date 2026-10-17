@@ -48,6 +48,18 @@ struct SurfaceParams {
     content_mask: PodBounds,
 }
 
+/// How one line list is drawn (see `LineParams` in the shaders).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LineParams {
+    offset: [f32; 2],
+    scale: [f32; 2],
+    color: [f32; 4],
+    content_mask: [f32; 4],
+    half_width: f32,
+    pad: [u32; 3],
+}
+
 /// One pass of a backdrop blur (see `BackdropParams` in the shaders).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -111,6 +123,13 @@ struct ShaderUnderlinesData {
 }
 
 #[derive(blade_macros::ShaderData)]
+struct ShaderLinesData {
+    globals: GlobalParams,
+    line_params: LineParams,
+    b_lines: gpu::BufferPiece,
+}
+
+#[derive(blade_macros::ShaderData)]
 struct ShaderMonoSpritesData {
     globals: GlobalParams,
     gamma_ratios: [f32; 4],
@@ -158,6 +177,7 @@ struct BladePipelines {
     path_rasterization: gpu::RenderPipeline,
     paths: gpu::RenderPipeline,
     underlines: gpu::RenderPipeline,
+    lines: gpu::RenderPipeline,
     mono_sprites: gpu::RenderPipeline,
     poly_sprites: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
@@ -187,6 +207,7 @@ impl BladePipelines {
         shader.check_struct_size::<MonochromeSprite>();
         shader.check_struct_size::<PolychromeSprite>();
         shader.check_struct_size::<BackdropParams>();
+        shader.check_struct_size::<LineParams>();
 
         // See https://apoorvaj.io/alpha-compositing-opengl-blending-and-premultiplied-alpha/
         let blend_mode = match surface_info.alpha {
@@ -313,6 +334,20 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
+            lines: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "lines",
+                data_layouts: &[&ShaderLinesData::layout()],
+                vertex: shader.at("vs_line"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_line")),
+                color_targets,
+                multisample_state: gpu::MultisampleState::default(),
+            }),
             mono_sprites: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "mono-sprites",
                 data_layouts: &[&ShaderMonoSpritesData::layout()],
@@ -382,6 +417,7 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.path_rasterization);
         gpu.destroy_render_pipeline(&mut self.paths);
         gpu.destroy_render_pipeline(&mut self.underlines);
+        gpu.destroy_render_pipeline(&mut self.lines);
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
@@ -1342,6 +1378,37 @@ impl BladeRenderer {
                         },
                     );
                     encoder.draw(0, 4, 0, underlines.len() as u32);
+                }
+                PrimitiveBatch::LineLists(lists) => {
+                    let mut encoder = pass.with(&self.pipelines.lines);
+                    for list in lists {
+                        // The segments as they are, one instance each.
+                        let instance_buf =
+                            unsafe { self.instance_belt.alloc_typed(&list.lines, &self.gpu) };
+                        let mask = &list.content_mask.bounds;
+                        let c = list.color;
+                        encoder.bind(
+                            0,
+                            &ShaderLinesData {
+                                globals,
+                                line_params: LineParams {
+                                    offset: [list.offset.x.0, list.offset.y.0],
+                                    scale: list.scale,
+                                    color: [c.h, c.s, c.l, c.a],
+                                    content_mask: [
+                                        mask.origin.x.0,
+                                        mask.origin.y.0,
+                                        mask.size.width.0,
+                                        mask.size.height.0,
+                                    ],
+                                    half_width: list.width.0 * 0.5,
+                                    pad: [0; 3],
+                                },
+                                b_lines: instance_buf,
+                            },
+                        );
+                        encoder.draw(0, 4, 0, list.lines.len() as u32);
+                    }
                 }
                 PrimitiveBatch::MonochromeSprites {
                     texture_id,

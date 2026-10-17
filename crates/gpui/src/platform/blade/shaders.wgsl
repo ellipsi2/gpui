@@ -1143,6 +1143,68 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha * input.color.a);
 }
 
+// --- line lists --- //
+
+struct LineParams {
+    // A point `p` of the lines is at `offset + p * scale` device pixels.
+    offset: vec2<f32>,
+    scale: vec2<f32>,
+    // Hsla.
+    color: vec4<f32>,
+    // Origin and size.
+    content_mask: vec4<f32>,
+    half_width: f32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+var<uniform> line_params: LineParams;
+// [x0, y0, x1, y1] per segment.
+var<storage, read> b_lines: array<vec4<f32>>;
+
+struct LineVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    // Signed distance from the segment's center line, in device pixels.
+    @location(1) across: f32,
+    @location(2) clip_distances: vec4<f32>,
+}
+
+// One segment per instance: a quad along it, half a pixel wider on each side than the line
+// for antialiasing.
+@vertex
+fn vs_line(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> LineVarying {
+    let line = b_lines[instance_id];
+    let a = line_params.offset + line.xy * line_params.scale;
+    let b = line_params.offset + line.zw * line_params.scale;
+    let d = b - a;
+    let len = length(d);
+    let dir = select(vec2<f32>(1.0, 0.0), d / len, len > 1e-6);
+    let normal = vec2<f32>(-dir.y, dir.x);
+    let extent = line_params.half_width + 0.5;
+    let side = f32(vertex_id & 1u) * 2.0 - 1.0;
+    let position = select(a, b, (vertex_id & 2u) != 0u) + normal * (side * extent);
+    let c = line_params.color;
+
+    var out = LineVarying();
+    out.position = to_device_position_impl(position);
+    out.color = hsla_to_rgba(Hsla(c.x, c.y, c.z, c.w));
+    out.across = side * extent;
+    let mask = Bounds(line_params.content_mask.xy, line_params.content_mask.zw);
+    out.clip_distances = distance_from_clip_rect_impl(position, mask);
+    return out;
+}
+
+@fragment
+fn fs_line(input: LineVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let coverage = saturate(line_params.half_width + 0.5 - abs(input.across));
+    return blend_color(input.color, coverage);
+}
+
 // --- monochrome sprites --- //
 
 struct MonochromeSprite {
