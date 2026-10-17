@@ -3,8 +3,8 @@
 
 use super::{BladeAtlas, BladeContext};
 use crate::{
-    Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
+    BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
+    PolychromeSprite, PrimitiveBatch, Quad, Rgba, ScaledPixels, Scene, Shadow, Size, Underline,
 };
 use blade_graphics as gpu;
 use blade_util::{BufferBelt, BufferBeltDescriptor};
@@ -46,6 +46,36 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+/// One pass of a backdrop blur (see `BackdropParams` in the shaders).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BackdropParams {
+    dest: [f32; 4],
+    source: [f32; 4],
+    tint: [f32; 4],
+    bounds: [f32; 4],
+    content_mask: [f32; 4],
+    corner_radii: [f32; 4],
+    target_size: [f32; 2],
+    direction: [f32; 2],
+    sigma: f32,
+    opacity: f32,
+    pad: [f32; 2],
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ShaderBackdropData {
+    backdrop: BackdropParams,
+    t_backdrop: gpu::TextureView,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ShaderBackdropCompositeData {
+    backdrop: BackdropParams,
+    t_backdrop: gpu::TextureView,
+    t_backdrop_frame: gpu::TextureView,
 }
 
 #[derive(blade_macros::ShaderData)]
@@ -131,6 +161,9 @@ struct BladePipelines {
     mono_sprites: gpu::RenderPipeline,
     poly_sprites: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
+    backdrop_downsample: gpu::RenderPipeline,
+    backdrop_blur: gpu::RenderPipeline,
+    backdrop_composite: gpu::RenderPipeline,
 }
 
 impl BladePipelines {
@@ -153,6 +186,7 @@ impl BladePipelines {
         shader.check_struct_size::<Underline>();
         shader.check_struct_size::<MonochromeSprite>();
         shader.check_struct_size::<PolychromeSprite>();
+        shader.check_struct_size::<BackdropParams>();
 
         // See https://apoorvaj.io/alpha-compositing-opengl-blending-and-premultiplied-alpha/
         let blend_mode = match surface_info.alpha {
@@ -165,6 +199,27 @@ impl BladePipelines {
             blend: Some(blend_mode),
             write_mask: gpu::ColorWrites::default(),
         }];
+        // Backdrop blur passes write their texels as they are.
+        let backdrop_pipeline = |name, fragment, layout, format| {
+            gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name,
+                data_layouts: &[layout],
+                vertex: shader.at("vs_backdrop"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at(fragment)),
+                color_targets: &[gpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: gpu::ColorWrites::default(),
+                }],
+                multisample_state: gpu::MultisampleState::default(),
+            })
+        };
 
         Self {
             quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
@@ -300,6 +355,24 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
+            backdrop_downsample: backdrop_pipeline(
+                "backdrop-downsample",
+                "fs_backdrop_downsample",
+                &ShaderBackdropData::layout(),
+                BACKDROP_FORMAT,
+            ),
+            backdrop_blur: backdrop_pipeline(
+                "backdrop-blur",
+                "fs_backdrop_blur",
+                &ShaderBackdropData::layout(),
+                BACKDROP_FORMAT,
+            ),
+            backdrop_composite: backdrop_pipeline(
+                "backdrop-composite",
+                "fs_backdrop_composite",
+                &ShaderBackdropCompositeData::layout(),
+                surface_info.format,
+            ),
         }
     }
 
@@ -312,6 +385,85 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
+        gpu.destroy_render_pipeline(&mut self.backdrop_downsample);
+        gpu.destroy_render_pipeline(&mut self.backdrop_blur);
+        gpu.destroy_render_pipeline(&mut self.backdrop_composite);
+    }
+}
+
+/// The quarter-resolution images of a backdrop blur.
+const BACKDROP_FORMAT: gpu::TextureFormat = gpu::TextureFormat::Rgba16Float;
+/// Frame pixels per quarter-resolution texel along each axis.
+const BACKDROP_SCALE: u32 = 4;
+
+/// Scratch textures of the backdrop blur, made at the first blur and dropped on resize.
+struct BackdropTextures {
+    /// The frame as it was before a blur, at full resolution.
+    frame: (gpu::Texture, gpu::TextureView),
+    /// Two quarter-resolution images the passes alternate between.
+    quarter: [(gpu::Texture, gpu::TextureView); 2],
+    quarter_size: [u32; 2],
+}
+
+impl BackdropTextures {
+    fn new(gpu: &gpu::Context, format: gpu::TextureFormat, size: gpu::Extent) -> Self {
+        let make = |name, format, width, height, usage| {
+            let texture = gpu.create_texture(gpu::TextureDesc {
+                name,
+                format,
+                size: gpu::Extent {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                array_layer_count: 1,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: gpu::TextureDimension::D2,
+                usage,
+                external: None,
+            });
+            let view = gpu.create_texture_view(
+                texture,
+                gpu::TextureViewDesc {
+                    name,
+                    format,
+                    dimension: gpu::ViewDimension::D2,
+                    subresources: &Default::default(),
+                },
+            );
+            (texture, view)
+        };
+        let quarter_size = [
+            size.width.div_ceil(BACKDROP_SCALE),
+            size.height.div_ceil(BACKDROP_SCALE),
+        ];
+        Self {
+            frame: make(
+                "backdrop frame",
+                format,
+                size.width,
+                size.height,
+                gpu::TextureUsage::COPY | gpu::TextureUsage::RESOURCE,
+            ),
+            quarter: [0, 1].map(|_| {
+                make(
+                    "backdrop quarter",
+                    BACKDROP_FORMAT,
+                    quarter_size[0],
+                    quarter_size[1],
+                    gpu::TextureUsage::RESOURCE | gpu::TextureUsage::TARGET,
+                )
+            }),
+            quarter_size,
+        }
+    }
+
+    fn destroy(self, gpu: &gpu::Context) {
+        for (texture, view) in [self.frame, self.quarter[0], self.quarter[1]] {
+            gpu.destroy_texture_view(view);
+            gpu.destroy_texture(texture);
+        }
     }
 }
 
@@ -370,6 +522,7 @@ pub struct BladeRenderer {
     path_intermediate_texture_view: gpu::TextureView,
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
+    backdrop_textures: Option<BackdropTextures>,
     rendering_parameters: RenderingParameters,
 }
 
@@ -380,18 +533,28 @@ impl BladeRenderer {
         window: &I,
         config: BladeSurfaceConfig,
     ) -> anyhow::Result<Self> {
-        let surface_config = gpu::SurfaceConfig {
+        // Backdrop blurs copy from frames; a surface that cannot be copied from draws none.
+        let mut surface_config = gpu::SurfaceConfig {
             size: config.size,
-            usage: gpu::TextureUsage::TARGET,
+            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
             display_sync: gpu::DisplaySync::Recent,
             color_space: gpu::ColorSpace::Srgb,
             allow_exclusive_full_screen: false,
             transparent: config.transparent,
         };
-        let surface = context
+        let surface = match context
             .gpu
             .create_surface_configured(window, surface_config)
-            .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?;
+        {
+            Ok(surface) => surface,
+            Err(_) => {
+                surface_config.usage = gpu::TextureUsage::TARGET;
+                context
+                    .gpu
+                    .create_surface_configured(window, surface_config)
+                    .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?
+            }
+        };
         Ok(Self::with_target(
             context,
             FrameTarget::Surface(surface),
@@ -407,7 +570,7 @@ impl BladeRenderer {
         let (texture, view) = import_shared_texture(&context.gpu, size, handle);
         let surface_config = gpu::SurfaceConfig {
             size,
-            usage: gpu::TextureUsage::TARGET,
+            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
             display_sync: gpu::DisplaySync::Recent,
             color_space: gpu::ColorSpace::Srgb,
             allow_exclusive_full_screen: false,
@@ -513,6 +676,7 @@ impl BladeRenderer {
             path_intermediate_texture_view,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
+            backdrop_textures: None,
             rendering_parameters,
         }
     }
@@ -579,6 +743,9 @@ impl BladeRenderer {
     }
 
     fn recreate_intermediate_textures(&mut self, gpu_size: gpu::Extent) {
+        if let Some(textures) = self.backdrop_textures.take() {
+            textures.destroy(&self.gpu);
+        }
         self.gpu.destroy_texture(self.path_intermediate_texture);
         self.gpu
             .destroy_texture_view(self.path_intermediate_texture_view);
@@ -750,6 +917,183 @@ impl BladeRenderer {
         }
         if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
             self.gpu.destroy_texture_view(msaa_view);
+        }
+        if let Some(textures) = self.backdrop_textures.take() {
+            textures.destroy(&self.gpu);
+        }
+    }
+
+    /// Blur and tint what the frame holds under `blur`: copy that region, average it to
+    /// quarter resolution, blur it along each axis, and composite it back upsampled. Runs
+    /// between render passes.
+    #[profiling::function]
+    fn draw_backdrop_blur(
+        &mut self,
+        blur: &BackdropBlur,
+        frame_texture: gpu::Texture,
+        frame_view: gpu::TextureView,
+    ) {
+        let size = self.surface_config.size;
+        let clip = blur.bounds.intersect(&blur.content_mask.bounds);
+        let region = [
+            clip.origin.x.0.floor().max(0.0) as u32,
+            clip.origin.y.0.floor().max(0.0) as u32,
+            (clip.origin.x.0 + clip.size.width.0)
+                .ceil()
+                .min(size.width as f32) as u32,
+            (clip.origin.y.0 + clip.size.height.0)
+                .ceil()
+                .min(size.height as f32) as u32,
+        ];
+        if region[0] >= region[2] || region[1] >= region[3] {
+            return;
+        }
+        let quarter = [
+            region[0] / BACKDROP_SCALE,
+            region[1] / BACKDROP_SCALE,
+            region[2].div_ceil(BACKDROP_SCALE),
+            region[3].div_ceil(BACKDROP_SCALE),
+        ]
+        .map(|v| v as f32);
+        if self.backdrop_textures.is_none() {
+            let textures = BackdropTextures::new(&self.gpu, self.target.info().format, size);
+            // Once, when made: initializing again would discard, without waiting, what an
+            // earlier blur of the same frame still reads.
+            for (texture, _) in [textures.frame, textures.quarter[0], textures.quarter[1]] {
+                self.command_encoder.init_texture(texture);
+            }
+            self.backdrop_textures = Some(textures);
+        }
+        let Some(textures) = &self.backdrop_textures else {
+            return;
+        };
+        let (copy, copy_view) = textures.frame;
+        let [(_, a_view), (_, b_view)] = textures.quarter;
+        let quarter_size = textures.quarter_size.map(|v| v as f32);
+
+        let piece = |texture| gpu::TexturePiece {
+            texture,
+            mip_level: 0,
+            array_layer: 0,
+            origin: [region[0], region[1], 0],
+        };
+        if let mut transfer = self.command_encoder.transfer("backdrop copy") {
+            transfer.copy_texture_to_texture(
+                piece(frame_texture),
+                piece(copy),
+                gpu::Extent {
+                    width: region[2] - region[0],
+                    height: region[3] - region[1],
+                    depth: 1,
+                },
+            );
+        }
+
+        let tint = Rgba::from(blur.tint);
+        let rect = |b: Bounds<ScaledPixels>| {
+            [
+                b.origin.x.0,
+                b.origin.y.0,
+                b.origin.x.0 + b.size.width.0,
+                b.origin.y.0 + b.size.height.0,
+            ]
+        };
+        let region = region.map(|v| v as f32);
+        let params = BackdropParams {
+            dest: quarter,
+            source: region,
+            tint: [tint.r, tint.g, tint.b, tint.a],
+            bounds: rect(blur.bounds),
+            content_mask: rect(blur.content_mask.bounds),
+            corner_radii: [
+                blur.corner_radii.top_left.0,
+                blur.corner_radii.top_right.0,
+                blur.corner_radii.bottom_right.0,
+                blur.corner_radii.bottom_left.0,
+            ],
+            target_size: quarter_size,
+            direction: [0.0; 2],
+            // ponytail: a pass reads 3 x 16 texels each way at most, so radii past 64 device
+            // pixels stop growing; a coarser quarter step would lift that.
+            sigma: (blur.blur_radius.0 / BACKDROP_SCALE as f32).clamp(0.5, 16.0),
+            opacity: blur.opacity.clamp(0.0, 1.0),
+            pad: [0.0; 2],
+        };
+        let blur_along = |direction| BackdropParams {
+            source: quarter,
+            direction,
+            ..params
+        };
+        let passes = [
+            (
+                &self.pipelines.backdrop_downsample,
+                a_view,
+                copy_view,
+                params,
+            ),
+            (
+                &self.pipelines.backdrop_blur,
+                b_view,
+                a_view,
+                blur_along([1.0, 0.0]),
+            ),
+            (
+                &self.pipelines.backdrop_blur,
+                a_view,
+                b_view,
+                blur_along([0.0, 1.0]),
+            ),
+        ];
+        for (pipeline, target, input, params) in passes {
+            if let mut pass = self.command_encoder.render(
+                "backdrop blur",
+                gpu::RenderTargetSet {
+                    colors: &[gpu::RenderTarget {
+                        view: target,
+                        init_op: gpu::InitOp::Load,
+                        finish_op: gpu::FinishOp::Store,
+                    }],
+                    depth_stencil: None,
+                },
+            ) {
+                let mut encoder = pass.with(pipeline);
+                encoder.bind(
+                    0,
+                    &ShaderBackdropData {
+                        backdrop: params,
+                        t_backdrop: input,
+                    },
+                );
+                encoder.draw(0, 4, 0, 1);
+            }
+        }
+
+        if let mut pass = self.command_encoder.render(
+            "backdrop composite",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: frame_view,
+                    init_op: gpu::InitOp::Load,
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
+            let mut encoder = pass.with(&self.pipelines.backdrop_composite);
+            encoder.bind(
+                0,
+                &ShaderBackdropCompositeData {
+                    backdrop: BackdropParams {
+                        dest: region,
+                        source: quarter,
+                        target_size: [size.width as f32, size.height as f32],
+                        ..params
+                    },
+                    t_backdrop: a_view,
+                    t_backdrop_frame: copy_view,
+                },
+            );
+            encoder.draw(0, 4, 0, 1);
         }
     }
 
@@ -932,6 +1276,26 @@ impl BladeRenderer {
                     );
                     encoder.draw(0, 4, 0, sprites.len() as u32);
                 }
+                PrimitiveBatch::BackdropBlurs(blurs) => {
+                    if !self.surface_config.usage.contains(gpu::TextureUsage::COPY) {
+                        continue;
+                    }
+                    drop(pass);
+                    for blur in blurs {
+                        self.draw_backdrop_blur(blur, frame_texture, frame_view);
+                    }
+                    pass = self.command_encoder.render(
+                        "main",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view: frame_view,
+                                init_op: gpu::InitOp::Load,
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: None,
+                        },
+                    );
+                }
                 PrimitiveBatch::Surfaces(surfaces) => {
                     let mut _encoder = pass.with(&self.pipelines.surfaces);
 
@@ -1061,7 +1425,8 @@ fn import_shared_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: gpu::TextureDimension::D2,
-        usage: gpu::TextureUsage::TARGET,
+        // Backdrop blurs copy from it.
+        usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
         external: Some(gpu::ExternalMemorySource::D3D11Texture(handle)),
     });
     let view = gpu.create_texture_view(

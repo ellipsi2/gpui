@@ -522,6 +522,9 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                // Not implemented on Metal: a backdrop blur draws nothing (the Blade renderer
+                // has it).
+                PrimitiveBatch::BackdropBlurs(_) => true,
             };
             if !ok {
                 command_encoder.end_encoding();

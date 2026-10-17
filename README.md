@@ -9,6 +9,7 @@ The branch shares no history with zed's `main`, so a Cargo git dependency on it 
 ## Changes from 0.2.2
 
 - **Windows renders through Blade (Vulkan)** instead of the DirectX 11 renderer, so Draw's renderer features are written once in WGSL. Direct3D 11 remains only to present: Blade draws each frame into a D3D11 texture shared with Vulkan, which a premultiplied DXGI composition swap chain shows through DirectComposition (Vulkan swapchains lose per-pixel window alpha on NVIDIA). See `crates/gpui/src/platform/windows/composition.rs` and Draw's `docs/design/gpui-vulkan.md`.
+- **Backdrop blur.** `Window::paint_backdrop_blur` blurs what is already drawn under a rounded rectangle and tints it (opaque glass). The Blade renderer copies the region, averages it to quarter resolution, runs a separable Gaussian and composites it back in scene order (`blade_renderer.rs`, `shaders.wgsl`); the Metal renderer draws nothing for it.
 - **`crates/blade-graphics`** is blade-graphics 0.7.1 (MIT, kvark/blade `88b6c64`), vendored unchanged in its own commit and then patched: D3D11 shared-texture import, the adapter LUID, and no destroy of a null swapchain (faults in NVIDIA's Windows driver).
 
 ## Crates

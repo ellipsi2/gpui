@@ -2,8 +2,8 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
+    AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
+    Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
@@ -2851,6 +2851,41 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
+        });
+    }
+
+    /// Paint a backdrop blur into the scene for the next frame at the current z-index: what is
+    /// already painted under `bounds`, rounded by `corner_radii`, blurred with a Gaussian of
+    /// standard deviation `blur_radius`, then mixed with `tint` at the tint's alpha (its
+    /// strength). The glass is opaque: transparent parts of what lies beneath show the tint's
+    /// color. Only what lies inside `bounds` (and the content mask) feeds the blur, clamped at
+    /// its edges. The blur runs at a quarter of the device resolution, so radii below a few
+    /// device pixels show that downsampling.
+    ///
+    /// Implemented by the Blade renderer (Windows, Linux, macOS with `macos-blade`); the Metal
+    /// renderer draws nothing for it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        tint: Hsla,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(BackdropBlur {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: blur_radius.scale(scale_factor),
+            tint,
+            opacity,
         });
     }
 

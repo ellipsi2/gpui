@@ -1319,3 +1319,107 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- backdrop blur --- //
+
+// One pass of a backdrop blur. Every pass covers `dest` of its target and reads its input
+// only inside `source`, clamping there.
+struct BackdropParams {
+    // Target pixels covered: left, top, right, bottom.
+    dest: vec4<f32>,
+    // Input texels that may be read: left, top, right, bottom (exclusive).
+    source: vec4<f32>,
+    // The tint (straight, opaque) and its strength in `a`.
+    tint: vec4<f32>,
+    // The blurred rectangle and the content mask in device pixels: left, top, right, bottom.
+    bounds: vec4<f32>,
+    content_mask: vec4<f32>,
+    // Top left, top right, bottom right, bottom left.
+    corner_radii: vec4<f32>,
+    target_size: vec2<f32>,
+    // One texel along the blur axis.
+    direction: vec2<f32>,
+    // Standard deviation in input texels.
+    sigma: f32,
+    opacity: f32,
+    pad: vec2<f32>,
+}
+var<uniform> backdrop: BackdropParams;
+var t_backdrop: texture_2d<f32>;
+// The frame as it was before the blur, at full resolution.
+var t_backdrop_frame: texture_2d<f32>;
+
+struct BackdropVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop(@builtin(vertex_index) vertex_id: u32) -> BackdropVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let position = mix(backdrop.dest.xy, backdrop.dest.zw, unit_vertex);
+    var out = BackdropVarying();
+    out.position = vec4<f32>(position / backdrop.target_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return out;
+}
+
+fn backdrop_texel(at: vec2<i32>) -> vec4<f32> {
+    let lo = vec2<i32>(backdrop.source.xy);
+    let hi = vec2<i32>(backdrop.source.zw) - vec2<i32>(1);
+    return textureLoad(t_backdrop, clamp(at, lo, hi), 0);
+}
+
+// A texel of the quarter-resolution image: the mean of its 4 x 4 frame pixels.
+@fragment
+fn fs_backdrop_downsample(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let origin = vec2<i32>(floor(input.position.xy)) * 4;
+    var sum = vec4<f32>(0.0);
+    for (var y = 0; y < 4; y += 1) {
+        for (var x = 0; x < 4; x += 1) {
+            sum += backdrop_texel(origin + vec2<i32>(x, y));
+        }
+    }
+    return sum / 16.0;
+}
+
+// One axis of the separable Gaussian.
+@fragment
+fn fs_backdrop_blur(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let at = vec2<i32>(floor(input.position.xy));
+    let step = vec2<i32>(backdrop.direction);
+    let radius = i32(ceil(backdrop.sigma * 3.0));
+    let falloff = -0.5 / (backdrop.sigma * backdrop.sigma);
+    var sum = vec4<f32>(0.0);
+    var total = 0.0;
+    for (var i = -radius; i <= radius; i += 1) {
+        let weight = exp(f32(i * i) * falloff);
+        sum += backdrop_texel(at + step * i) * weight;
+        total += weight;
+    }
+    return sum / total;
+}
+
+// The blur, upsampled bilinearly and tinted, replaces the frame inside the rounded rectangle.
+// The result is opaque (on a straight-alpha target the frame is taken as opaque).
+@fragment
+fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let point = input.position.xy;
+    let frame = textureLoad(t_backdrop_frame, vec2<i32>(floor(point)), 0);
+    let mask = backdrop.content_mask;
+    if (any(point < mask.xy) || any(point >= mask.zw)) {
+        return frame;
+    }
+    let texel = point / 4.0 - 0.5;
+    let base = floor(texel);
+    let weight = texel - base;
+    let at = vec2<i32>(base);
+    let top = mix(backdrop_texel(at), backdrop_texel(at + vec2<i32>(1, 0)), weight.x);
+    let bottom = mix(backdrop_texel(at + vec2<i32>(0, 1)), backdrop_texel(at + vec2<i32>(1, 1)), weight.x);
+    let blurred = mix(top, bottom, weight.y);
+    // Glass is opaque: what shows through transparent parts of the blur is the tint.
+    let backed = blurred.rgb + backdrop.tint.rgb * (1.0 - blurred.a);
+    let tinted = vec4<f32>(mix(backed, backdrop.tint.rgb, backdrop.tint.a), 1.0);
+    let bounds = Bounds(backdrop.bounds.xy, backdrop.bounds.zw - backdrop.bounds.xy);
+    let radii = Corners(backdrop.corner_radii.x, backdrop.corner_radii.y, backdrop.corner_radii.z, backdrop.corner_radii.w);
+    let coverage = saturate(0.5 - quad_sdf(point, bounds, radii)) * backdrop.opacity;
+    return mix(frame, tinted, coverage);
+}
