@@ -661,8 +661,11 @@ fragment float4 monochrome_sprite_fragment(
 
 struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
+  // Position within the tile, 0 to 1.
   float2 tile_position;
   uint sprite_id [[flat]];
+  // Position in the sprite's untransformed space.
+  float2 local_position;
   float clip_distance [[clip_distance]][4];
 };
 
@@ -670,6 +673,7 @@ struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
+  float2 local_position;
 };
 
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
@@ -683,16 +687,30 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float4 device_position = to_device_position_transformed(
+      unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, sprite.bounds, sprite.content_mask.bounds,
+      sprite.transformation);
+  float2 local_position =
+      unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height) +
+      float2(sprite.bounds.origin.x, sprite.bounds.origin.y);
   return PolychromeSpriteVertexOutput{
       device_position,
-      tile_position,
+      unit_vertex,
       sprite_id,
+      local_position,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Texel `at` of the tile (clamped to it, so neighbours in the atlas never bleed in),
+// premultiplied.
+float4 polychrome_sprite_texel(texture2d<float> atlas_texture, AtlasTile tile,
+                               int2 at) {
+  int2 size = int2(tile.bounds.size.width, tile.bounds.size.height);
+  int2 origin = int2(tile.bounds.origin.x, tile.bounds.origin.y);
+  float4 texel = atlas_texture.read(uint2(origin + clamp(at, int2(0), size - 1)));
+  return float4(texel.rgb * texel.a, texel.a);
 }
 
 fragment float4 polychrome_sprite_fragment(
@@ -700,14 +718,30 @@ fragment float4 polychrome_sprite_fragment(
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
-  constexpr sampler atlas_texture_sampler(mag_filter::linear,
-                                          min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  // Bilinear filtering with premultiplied alpha: the atlas holds straight alpha,
+  // which a hardware filter would darken toward transparent texels.
+  float2 texel = input.tile_position *
+                     float2(sprite.tile.bounds.size.width,
+                            sprite.tile.bounds.size.height) -
+                 0.5;
+  float2 base = floor(texel);
+  float2 weight = texel - base;
+  int2 at = int2(base);
+  float4 top = mix(polychrome_sprite_texel(atlas_texture, sprite.tile, at),
+                   polychrome_sprite_texel(atlas_texture, sprite.tile, at + int2(1, 0)),
+                   weight.x);
+  float4 bottom = mix(polychrome_sprite_texel(atlas_texture, sprite.tile, at + int2(0, 1)),
+                      polychrome_sprite_texel(atlas_texture, sprite.tile, at + int2(1, 1)),
+                      weight.x);
+  float4 premultiplied = mix(top, bottom, weight.y);
+  float4 color = float4(0.0);
+  if (premultiplied.a > 0.0) {
+    color = float4(premultiplied.rgb / premultiplied.a, premultiplied.a);
+  }
+  // The mask's edge is antialiased in untransformed pixels.
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.local_position, sprite.mask, sprite.corner_radii);
 
-  float4 color = sample;
   if (sprite.grayscale) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.r = grayscale;

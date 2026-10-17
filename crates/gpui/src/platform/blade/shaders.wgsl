@@ -1202,13 +1202,18 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    mask: Bounds,
+    transformation: TransformationMatrix,
 }
 var<storage, read> b_poly_sprites: array<PolychromeSprite>;
 
 struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
+    // Position within the tile, 0 to 1.
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
+    // Position in the sprite's untransformed space.
+    @location(2) local_position: vec2<f32>,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1218,28 +1223,48 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = b_poly_sprites[instance_id];
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
-    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.tile_position = unit_vertex;
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.local_position = unit_vertex * sprite.bounds.size + sprite.bounds.origin;
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
+}
+
+// Texel `at` of the tile (clamped to it, so neighbours in the atlas never bleed in),
+// premultiplied.
+fn poly_sprite_texel(tile: AtlasTile, at: vec2<i32>) -> vec4<f32> {
+    let texel = textureLoad(t_sprite, tile.bounds.origin + clamp(at, vec2<i32>(0), tile.bounds.size - 1), 0);
+    return vec4<f32>(texel.rgb * texel.a, texel.a);
 }
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
     let sprite = b_poly_sprites[input.sprite_id];
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    // Bilinear filtering with premultiplied alpha: the atlas holds straight alpha, which a
+    // hardware filter would darken toward transparent texels.
+    let texel = input.tile_position * vec2<f32>(sprite.tile.bounds.size) - 0.5;
+    let base = floor(texel);
+    let weight = texel - base;
+    let at = vec2<i32>(base);
+    let top = mix(poly_sprite_texel(sprite.tile, at), poly_sprite_texel(sprite.tile, at + vec2<i32>(1, 0)), weight.x);
+    let bottom = mix(poly_sprite_texel(sprite.tile, at + vec2<i32>(0, 1)), poly_sprite_texel(sprite.tile, at + vec2<i32>(1, 1)), weight.x);
+    let premultiplied = mix(top, bottom, weight.y);
+    var color = vec4<f32>(0.0);
+    if (premultiplied.a > 0.0) {
+        color = vec4<f32>(premultiplied.rgb / premultiplied.a, premultiplied.a);
+    }
 
-    var color = sample;
+    // The mask's edge is antialiased in untransformed pixels.
+    let distance = quad_sdf(input.local_position, sprite.mask, sprite.corner_radii);
+
     if ((sprite.grayscale & 0xFFu) != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
-        color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+        color = vec4<f32>(vec3<f32>(grayscale), color.a);
     }
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }

@@ -66,9 +66,11 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let bounds = match &primitive {
+            Primitive::PolychromeSprite(sprite) => sprite.screen_bounds(),
+            primitive => *primitive.bounds(),
+        };
+        let clipped_bounds = bounds.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             return;
@@ -645,6 +647,41 @@ pub(crate) struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    /// What shows of `bounds`, in the same untransformed space, with an antialiased edge.
+    pub mask: Bounds<ScaledPixels>,
+    pub transformation: TransformationMatrix,
+}
+
+impl PolychromeSprite {
+    /// The screen rectangle around the shown part of the sprite once transformed.
+    fn screen_bounds(&self) -> Bounds<ScaledPixels> {
+        let shown = self.bounds.intersect(&self.mask);
+        if self.transformation == TransformationMatrix::unit() {
+            return shown;
+        }
+        let [[a, b], [c, d]] = self.transformation.rotation_scale;
+        let [tx, ty] = self.transformation.translation;
+        let (mut min, mut max) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for corner in [
+            shown.origin,
+            shown.top_right(),
+            shown.bottom_left(),
+            shown.bottom_right(),
+        ] {
+            let (x, y) = (corner.x.0, corner.y.0);
+            for (i, v) in [a * x + b * y + tx, c * x + d * y + ty]
+                .into_iter()
+                .enumerate()
+            {
+                min[i] = min[i].min(v);
+                max[i] = max[i].max(v);
+            }
+        }
+        Bounds::from_corners(
+            point(ScaledPixels(min[0]), ScaledPixels(min[1])),
+            point(ScaledPixels(max[0]), ScaledPixels(max[1])),
+        )
+    }
 }
 
 impl From<PolychromeSprite> for Primitive {

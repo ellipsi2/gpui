@@ -3054,6 +3054,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                mask: bounds,
+                transformation: TransformationMatrix::unit(),
             });
         }
         Ok(())
@@ -3134,10 +3136,66 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        let bounds = bounds
+            .scale(self.scale_factor())
+            .map_origin(|origin| origin.floor())
+            .map_size(|size| size.ceil());
+        self.insert_image(
+            bounds,
+            bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint an image transformed by `transformation`, which maps scaled (device) pixels to
+    /// scaled pixels on screen, as in [`Window::paint_svg`]. Only the part of `bounds` inside
+    /// `mask` shows, with an antialiased edge one device pixel wide; both are in the
+    /// untransformed space and are used as given, without rounding to device pixels. The
+    /// image is filtered bilinearly with premultiplied alpha.
+    /// This method will panic if the frame_index is not valid
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_image_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        mask: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
+        let scale_factor = self.scale_factor();
+        self.insert_image(
+            bounds.scale(scale_factor),
+            mask.scale(scale_factor),
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            transformation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_image(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        mask: Bounds<ScaledPixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -3163,13 +3221,13 @@ impl Window {
             order: 0,
             pad: 0,
             grayscale,
-            bounds: bounds
-                .map_origin(|origin| origin.floor())
-                .map_size(|size| size.ceil()),
+            bounds,
             content_mask,
             corner_radii,
             tile,
             opacity,
+            mask,
+            transformation,
         });
         Ok(())
     }
