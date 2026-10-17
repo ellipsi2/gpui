@@ -138,6 +138,9 @@ pub struct DeviceInformation {
     pub driver_name: String,
     /// Further information about the driver
     pub driver_info: String,
+    /// The adapter's locally unique identifier, when the driver reports one (Windows), to find
+    /// the same adapter through another API.
+    pub luid: Option<[u8; 8]>,
 }
 
 impl Context {
@@ -175,6 +178,11 @@ pub enum ExternalMemorySource {
 
     #[cfg(target_os = "windows")]
     Win32KMT(Option<isize>),
+
+    /// Import only: an NT handle of a Direct3D 11 texture created with
+    /// `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`. Textures only; the allocation is dedicated.
+    #[cfg(target_os = "windows")]
+    D3D11Texture(isize),
 
     #[cfg(not(target_os = "windows"))]
     Fd(Option<i32>),

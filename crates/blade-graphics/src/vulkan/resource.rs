@@ -15,6 +15,7 @@ impl super::Context {
         &self,
         requirements: vk::MemoryRequirements,
         memory: crate::Memory,
+        dedicated_image: Option<vk::Image>,
     ) -> Allocation {
         let mut manager = self.memory.lock().unwrap();
         let device_address_usage = if self.device.ray_tracing.is_some() {
@@ -45,6 +46,27 @@ impl super::Context {
                         .core
                         .get_physical_device_memory_properties(self.physical_device)
                 };
+                // An imported D3D11 texture may only live in the memory types its handle allows.
+                #[cfg(target_os = "windows")]
+                let memory_types = match e {
+                    crate::ExternalMemorySource::D3D11Texture(handle) => {
+                        let mut properties = vk::MemoryWin32HandlePropertiesKHR::default();
+                        unsafe {
+                            self.device
+                                .external_memory
+                                .as_ref()
+                                .expect("External memory is not supported")
+                                .get_memory_win32_handle_properties(
+                                    vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE,
+                                    handle,
+                                    &mut properties,
+                                )
+                                .unwrap()
+                        };
+                        memory_types & properties.memory_type_bits
+                    }
+                    _ => memory_types,
+                };
                 let memory_type_index = memory_types.ilog2();
                 let memory_type: vk::MemoryType =
                     memory_properties.memory_types[memory_type_index as usize];
@@ -53,7 +75,8 @@ impl super::Context {
                 let external_info: &mut dyn vk::ExtendsMemoryAllocateInfo = match e {
                     #[cfg(target_os = "windows")]
                     crate::ExternalMemorySource::Win32(Some(handle))
-                    | crate::ExternalMemorySource::Win32KMT(Some(handle)) => {
+                    | crate::ExternalMemorySource::Win32KMT(Some(handle))
+                    | crate::ExternalMemorySource::D3D11Texture(handle) => {
                         &mut vk::ImportMemoryWin32HandleInfoKHR {
                             handle_type,
                             handle,
@@ -86,12 +109,20 @@ impl super::Context {
                     },
                 };
 
-                let allocation_info = vk::MemoryAllocateInfo {
+                let mut dedicated_info =
+                    dedicated_image.map(|image| vk::MemoryDedicatedAllocateInfo {
+                        image,
+                        ..Default::default()
+                    });
+                let mut allocation_info = vk::MemoryAllocateInfo {
                     allocation_size: requirements.size,
                     memory_type_index,
                     ..vk::MemoryAllocateInfo::default()
                 }
                 .push_next(external_info);
+                if let Some(dedicated_info) = dedicated_info.as_mut() {
+                    allocation_info = allocation_info.push_next(dedicated_info);
+                }
 
                 let memory = unsafe {
                     self.device
@@ -314,7 +345,7 @@ impl crate::traits::ResourceDevice for super::Context {
         let raw = unsafe { self.device.core.create_buffer(&vk_info, None).unwrap() };
         let mut requirements = unsafe { self.device.core.get_buffer_memory_requirements(raw) };
         requirements.alignment = requirements.alignment.max(self.min_buffer_alignment);
-        let allocation = self.allocate_memory(requirements, desc.memory);
+        let allocation = self.allocate_memory(requirements, desc.memory, None);
 
         log::info!(
             "Creating buffer {:?} of size {}, name '{}', handle {:?}",
@@ -392,10 +423,20 @@ impl crate::traits::ResourceDevice for super::Context {
         */
         let raw = unsafe { self.device.core.create_image(&vk_info, None).unwrap() };
         let requirements = unsafe { self.device.core.get_image_memory_requirements(raw) };
+        // Imported D3D11 textures need a dedicated allocation.
+        #[cfg(target_os = "windows")]
+        let dedicated = matches!(
+            desc.external,
+            Some(crate::ExternalMemorySource::D3D11Texture(_))
+        )
+        .then_some(raw);
+        #[cfg(not(target_os = "windows"))]
+        let dedicated = None;
         let allocation = self.allocate_memory(
             requirements,
             desc.external
                 .map_or(crate::Memory::Device, crate::Memory::External),
+            dedicated,
         );
 
         log::info!(
@@ -520,7 +561,7 @@ impl crate::traits::ResourceDevice for super::Context {
 
         let buffer = unsafe { self.device.core.create_buffer(&buffer_info, None).unwrap() };
         let requirements = unsafe { self.device.core.get_buffer_memory_requirements(buffer) };
-        let allocation = self.allocate_memory(requirements, crate::Memory::Device);
+        let allocation = self.allocate_memory(requirements, crate::Memory::Device, None);
 
         unsafe {
             self.device
@@ -663,6 +704,10 @@ fn external_source_handle_type(
         #[cfg(target_os = "windows")]
         crate::ExternalMemorySource::Win32KMT(_) => {
             vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT
+        }
+        #[cfg(target_os = "windows")]
+        crate::ExternalMemorySource::D3D11Texture(_) => {
+            vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE
         }
         #[cfg(not(target_os = "windows"))]
         crate::ExternalMemorySource::Fd(_) => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,

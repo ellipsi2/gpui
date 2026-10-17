@@ -87,6 +87,7 @@ impl super::Context {
             device_name: glow.get_parameter_string(glow::VENDOR),
             driver_name: glow.get_parameter_string(glow::RENDERER),
             driver_info: glow.get_parameter_string(glow::VERSION),
+            luid: None,
         };
 
         Ok(super::Context {

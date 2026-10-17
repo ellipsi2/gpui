@@ -88,7 +88,9 @@ unsafe fn inspect_adapter(
         vk::PhysicalDevicePortabilitySubsetPropertiesKHR::default();
 
     let mut driver_properties = vk::PhysicalDeviceDriverPropertiesKHR::default();
+    let mut id_properties = vk::PhysicalDeviceIDProperties::default();
     let mut properties2_khr = vk::PhysicalDeviceProperties2KHR::default()
+        .push_next(&mut id_properties)
         .push_next(&mut inline_uniform_block_properties)
         .push_next(&mut timeline_semaphore_properties)
         .push_next(&mut descriptor_indexing_properties)
@@ -275,6 +277,7 @@ unsafe fn inspect_adapter(
         driver_info: ffi::CStr::from_ptr(driver_properties.driver_info.as_ptr())
             .to_string_lossy()
             .to_string(),
+        luid: (id_properties.device_luid_valid != vk::FALSE).then_some(id_properties.device_luid),
     };
 
     Some(AdapterCapabilities {
