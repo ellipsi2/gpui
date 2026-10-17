@@ -524,6 +524,19 @@ pub struct BladeRenderer {
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
     backdrop_textures: Option<BackdropTextures>,
     rendering_parameters: RenderingParameters,
+    /// Imports of `ExternalImage`s, by the address of their source.
+    #[cfg(target_os = "windows")]
+    external_images: std::collections::HashMap<usize, ExternalImport>,
+}
+
+/// An imported `ExternalImage`; no texture when its import failed (it is not retried).
+#[cfg(target_os = "windows")]
+struct ExternalImport {
+    source: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    texture: Option<(gpu::Texture, gpu::TextureView)>,
+    /// The `in_use` address of the frame last acquired: each new frame of the source was
+    /// released by the exporter and is acquired once.
+    frame: usize,
 }
 
 impl BladeRenderer {
@@ -678,6 +691,8 @@ impl BladeRenderer {
             path_intermediate_msaa_texture_view,
             backdrop_textures: None,
             rendering_parameters,
+            #[cfg(target_os = "windows")]
+            external_images: Default::default(),
         }
     }
 
@@ -819,6 +834,7 @@ impl BladeRenderer {
             device_name: info.device_name.clone(),
             driver_name: info.driver_name.clone(),
             driver_info: info.driver_info.clone(),
+            adapter_luid: info.luid,
         }
     }
 
@@ -920,6 +936,96 @@ impl BladeRenderer {
         }
         if let Some(textures) = self.backdrop_textures.take() {
             textures.destroy(&self.gpu);
+        }
+        #[cfg(target_os = "windows")]
+        for (_, import) in self.external_images.drain() {
+            destroy_external_import(&self.gpu, import);
+        }
+    }
+
+    /// Import the external images `scene` shows that are not imported yet, and set their
+    /// layout, before the frame's first pass. Imports whose source died are freed first: the
+    /// previous frame finished (every frame is waited on), so nothing reads them any more.
+    #[cfg(target_os = "windows")]
+    fn import_external_images(&mut self, scene: &Scene) {
+        let dead: Vec<usize> = self
+            .external_images
+            .iter()
+            .filter(|(_, import)| import.source.strong_count() == 0)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in dead {
+            if let Some(import) = self.external_images.remove(&key) {
+                destroy_external_import(&self.gpu, import);
+            }
+        }
+        for surface in &scene.surfaces {
+            let image = &surface.image;
+            let key = external_key(image);
+            let frame = Arc::as_ptr(&image.in_use) as *const () as usize;
+            let family = self.gpu.queue_family_index();
+            if let Some(import) = self.external_images.get_mut(&key) {
+                if let Some((texture, _)) = import.texture
+                    && import.frame != frame
+                {
+                    self.command_encoder
+                        .acquire_external_texture(texture, family);
+                    import.frame = frame;
+                }
+                continue;
+            }
+            let desc = gpu::TextureDesc {
+                name: "external image",
+                format: EXTERNAL_FORMAT,
+                size: gpu::Extent {
+                    width: image.size.width.0.max(0) as u32,
+                    height: image.size.height.0.max(0) as u32,
+                    depth: 1,
+                },
+                array_layer_count: 1,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: gpu::TextureDimension::D2,
+                usage: gpu::TextureUsage::TARGET
+                    | gpu::TextureUsage::RESOURCE
+                    | gpu::TextureUsage::COPY,
+                external: None,
+            };
+            let texture = match self.gpu.import_win32_texture(
+                desc,
+                image.handle,
+                image.memory_type,
+                image.allocation_size,
+            ) {
+                Ok(texture) => {
+                    // Blade keeps textures in GENERAL; the exporter released the image in it.
+                    // No barrier from UNDEFINED, which may discard the contents.
+                    self.command_encoder
+                        .acquire_external_texture(texture, family);
+                    let view = self.gpu.create_texture_view(
+                        texture,
+                        gpu::TextureViewDesc {
+                            name: "external image view",
+                            format: EXTERNAL_FORMAT,
+                            dimension: gpu::ViewDimension::D2,
+                            subresources: &Default::default(),
+                        },
+                    );
+                    Some((texture, view))
+                }
+                Err(e) => {
+                    log::error!("external image import failed: {e}");
+                    None
+                }
+            };
+            self.external_images.insert(
+                key,
+                ExternalImport {
+                    source: Arc::downgrade(&image.source),
+                    texture,
+                    frame,
+                },
+            );
         }
     }
 
@@ -1112,6 +1218,8 @@ impl BladeRenderer {
             FrameTarget::Shared { texture, view } => (None, *texture, *view),
         };
         self.command_encoder.init_texture(frame_texture);
+        #[cfg(target_os = "windows")]
+        self.import_external_images(scene);
 
         let globals = GlobalParams {
             viewport_size: [
@@ -1296,6 +1404,57 @@ impl BladeRenderer {
                         },
                     );
                 }
+                #[cfg(target_os = "windows")]
+                PrimitiveBatch::Surfaces(surfaces) => {
+                    let mut encoder = pass.with(&self.pipelines.poly_sprites);
+                    for surface in surfaces {
+                        let Some((_, view)) = self
+                            .external_images
+                            .get(&external_key(&surface.image))
+                            .and_then(|import| import.texture)
+                        else {
+                            continue;
+                        };
+                        // The whole image as one polychrome sprite (straight alpha, as the
+                        // atlas holds), untransformed and unmasked.
+                        let sprite = PolychromeSprite {
+                            order: surface.order,
+                            pad: 0,
+                            grayscale: false,
+                            opacity: 1.0,
+                            bounds: surface.bounds,
+                            content_mask: surface.content_mask.clone(),
+                            corner_radii: Default::default(),
+                            tile: crate::AtlasTile {
+                                texture_id: crate::AtlasTextureId {
+                                    index: 0,
+                                    kind: crate::AtlasTextureKind::Polychrome,
+                                },
+                                tile_id: crate::TileId(0),
+                                padding: 0,
+                                bounds: Bounds {
+                                    origin: Point::default(),
+                                    size: surface.image.size,
+                                },
+                            },
+                            mask: surface.bounds,
+                            transformation: crate::TransformationMatrix::unit(),
+                        };
+                        let instance_buf =
+                            unsafe { self.instance_belt.alloc_typed(&[sprite], &self.gpu) };
+                        encoder.bind(
+                            0,
+                            &ShaderPolySpritesData {
+                                globals,
+                                t_sprite: view,
+                                s_sprite: self.atlas_sampler,
+                                b_poly_sprites: instance_buf,
+                            },
+                        );
+                        encoder.draw(0, 4, 0, 1);
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
                 PrimitiveBatch::Surfaces(surfaces) => {
                     let mut _encoder = pass.with(&self.pipelines.surfaces);
 
@@ -1407,6 +1566,24 @@ impl BladeRenderer {
         if matches!(self.target, FrameTarget::Shared { .. }) {
             self.wait_for_gpu();
         }
+    }
+}
+
+/// The format of an `ExternalImage` (`VK_FORMAT_B8G8R8A8_UNORM` on the exporter's side).
+#[cfg(target_os = "windows")]
+const EXTERNAL_FORMAT: gpu::TextureFormat = gpu::TextureFormat::Bgra8Unorm;
+
+/// The import cache key of an external image: its source's address.
+#[cfg(target_os = "windows")]
+fn external_key(image: &crate::ExternalImage) -> usize {
+    Arc::as_ptr(&image.source) as *const () as usize
+}
+
+#[cfg(target_os = "windows")]
+fn destroy_external_import(gpu: &gpu::Context, import: ExternalImport) {
+    if let Some((texture, view)) = import.texture {
+        gpu.destroy_texture_view(view);
+        gpu.destroy_texture(texture);
     }
 }
 

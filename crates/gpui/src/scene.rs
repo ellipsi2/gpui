@@ -735,6 +735,9 @@ pub(crate) struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// An image of another Vulkan device ([`crate::Window::paint_external_image`]).
+    #[cfg(target_os = "windows")]
+    pub image: crate::ExternalImage,
 }
 
 impl From<PaintSurface> for Primitive {

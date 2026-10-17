@@ -303,6 +303,119 @@ impl super::Context {
     ) -> Option<crate::ExternalMemorySource> {
         buffer.external
     }
+
+    /// The queue family every command encoder of this context submits to.
+    pub fn queue_family_index(&self) -> u32 {
+        self.queue_family_index
+    }
+
+    /// Imports a 2D texture another Vulkan device exported as an `OPAQUE_WIN32` NT handle.
+    /// `desc` must describe the exporter's image exactly (format, size, one mip level and
+    /// layer, optimal tiling, the usage flags `desc.usage` maps to, `external: None`), which
+    /// was bound to a dedicated allocation of `allocation_size` bytes in `memory_type`; both
+    /// devices must be on the same physical GPU. Fails instead of panicking, so a foreign or
+    /// stale handle does not bring the renderer down. Destroy it with `destroy_texture`.
+    #[cfg(target_os = "windows")]
+    pub fn import_win32_texture(
+        &self,
+        desc: crate::TextureDesc,
+        handle: isize,
+        memory_type: u32,
+        allocation_size: u64,
+    ) -> Result<super::Texture, String> {
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32;
+        if self.device.external_memory.is_none() {
+            return Err("VK_KHR_external_memory_win32 is not enabled".into());
+        }
+        let mut external = vk::ExternalMemoryImageCreateInfo {
+            handle_types: handle_type,
+            ..Default::default()
+        };
+        let info = vk::ImageCreateInfo {
+            image_type: map_texture_dimension(desc.dimension),
+            format: super::map_texture_format(desc.format),
+            extent: super::map_extent_3d(&desc.size),
+            mip_levels: desc.mip_level_count,
+            array_layers: desc.array_layer_count,
+            samples: vk::SampleCountFlags::from_raw(desc.sample_count),
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: map_texture_usage(desc.usage, desc.format.aspects()),
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            ..Default::default()
+        }
+        .push_next(&mut external);
+        let device = &self.device.core;
+        let raw = unsafe { device.create_image(&info, None) }
+            .map_err(|e| format!("vkCreateImage: {e}"))?;
+        let memory_properties = unsafe {
+            self.instance
+                .core
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let requirements = unsafe { device.get_image_memory_requirements(raw) };
+        if memory_type >= memory_properties.memory_type_count
+            || requirements.memory_type_bits & (1 << memory_type) == 0
+            || requirements.size > allocation_size
+        {
+            unsafe { device.destroy_image(raw, None) };
+            return Err(format!(
+                "memory type {memory_type} / {allocation_size} bytes do not fit the image ({:?})",
+                requirements
+            ));
+        }
+        let mut import = vk::ImportMemoryWin32HandleInfoKHR {
+            handle_type,
+            handle,
+            ..Default::default()
+        };
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo {
+            image: raw,
+            ..Default::default()
+        };
+        let allocation = vk::MemoryAllocateInfo {
+            allocation_size,
+            memory_type_index: memory_type,
+            ..Default::default()
+        }
+        .push_next(&mut import)
+        .push_next(&mut dedicated);
+        let memory = match unsafe { device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                unsafe { device.destroy_image(raw, None) };
+                return Err(format!("vkAllocateMemory (import): {e}"));
+            }
+        };
+        if let Err(e) = unsafe { device.bind_image_memory(raw, memory, 0) } {
+            unsafe {
+                device.destroy_image(raw, None);
+                device.free_memory(memory, None);
+            }
+            return Err(format!("vkBindImageMemory: {e}"));
+        }
+        if !desc.name.is_empty() {
+            self.set_object_name(raw, desc.name);
+        }
+        let flags = memory_properties.memory_types[memory_type as usize].property_flags;
+        let mut manager = self.memory.lock().unwrap();
+        // The allocator frees the imported memory when `destroy_texture` deallocates it.
+        let block = unsafe {
+            manager.allocator.import_memory(
+                memory,
+                memory_type,
+                gpu_alloc_ash::memory_properties_from_ash(flags),
+                0,
+                allocation_size,
+            )
+        };
+        Ok(super::Texture {
+            raw,
+            memory_handle: manager.slab.insert(block),
+            target_size: [desc.size.width as u16, desc.size.height as u16],
+            format: desc.format,
+            external: None,
+        })
+    }
 }
 
 #[hidden_trait::expose]

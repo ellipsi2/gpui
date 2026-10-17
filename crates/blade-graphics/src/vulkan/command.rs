@@ -228,6 +228,40 @@ fn end_pass(device: &super::Device, cmd_buf: vk::CommandBuffer) {
 }
 
 impl super::CommandEncoder {
+    /// Acquires `texture`, imported from another device that released it to
+    /// `VK_QUEUE_FAMILY_EXTERNAL` in GENERAL layout, for `queue_family_index` (the context's,
+    /// see `Context::queue_family_index`), keeping its contents. Record once per release, before
+    /// the first pass that reads it.
+    pub fn acquire_external_texture(&mut self, texture: super::Texture, queue_family_index: u32) {
+        let barrier = vk::ImageMemoryBarrier {
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
+            old_layout: vk::ImageLayout::GENERAL,
+            new_layout: vk::ImageLayout::GENERAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_EXTERNAL,
+            dst_queue_family_index: queue_family_index,
+            image: texture.raw,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: super::map_aspects(texture.format.aspects()),
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            },
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.buffers[0].raw,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
     fn add_marker(&mut self, marker: &str) {
         if let Some(ref mut ch) = self.crash_handler {
             let id = ch.add_marker(marker);

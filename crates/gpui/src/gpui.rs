@@ -308,4 +308,42 @@ pub struct GpuSpecs {
     pub driver_name: String,
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
+    /// The adapter's locally unique identifier (Windows), to open another device on the same
+    /// GPU, e.g. one whose images [`Window::paint_external_image`] shows.
+    pub adapter_luid: Option<[u8; 8]>,
+}
+
+/// An image another Vulkan device rendered, shown by [`Window::paint_external_image`]
+/// without a copy through the CPU. Windows only; other platforms draw nothing for it.
+///
+/// The exporter's image is a 2D `B8G8R8A8_UNORM` image with straight alpha, one mip level and
+/// layer, optimal tiling, exclusive sharing, `COLOR_ATTACHMENT | SAMPLED | TRANSFER_SRC |
+/// TRANSFER_DST` usage and no create flags, bound to a dedicated allocation exported as an `OPAQUE_WIN32` NT handle, on the
+/// adapter of [`GpuSpecs::adapter_luid`], and left in `GENERAL` layout with its writes
+/// finished (fence-waited) before it is painted. An import that fails draws nothing.
+#[derive(Clone)]
+pub struct ExternalImage {
+    /// Owns `handle` and keeps it open while it lives. The import is cached per source and
+    /// released once the source is dropped.
+    pub source: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    /// Held by every frame that shows this image: the exporter must not write the image again
+    /// until it is dropped. A frame keeps it until GPUI has finished drawing that frame.
+    pub in_use: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    /// The `OPAQUE_WIN32` NT handle of the image's memory.
+    pub handle: isize,
+    /// The image size in pixels.
+    pub size: Size<DevicePixels>,
+    /// The memory type index of the exported allocation.
+    pub memory_type: u32,
+    /// The size of the exported allocation in bytes.
+    pub allocation_size: u64,
+}
+
+impl std::fmt::Debug for ExternalImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalImage")
+            .field("handle", &self.handle)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }

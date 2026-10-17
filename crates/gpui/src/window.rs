@@ -3287,6 +3287,37 @@ impl Window {
         });
     }
 
+    /// Paint an image another Vulkan device rendered (see [`ExternalImage`]) into `bounds`
+    /// for the next frame, in scene order. Like [`Window::paint_image`], `bounds` is widened to
+    /// whole device pixels, so bounds the image's size in device pixels show one texel per
+    /// pixel. Its import stays cached while `image.source` lives.
+    /// Windows only; other platforms draw nothing.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_external_image(&mut self, bounds: Bounds<Pixels>, image: crate::ExternalImage) {
+        self.invalidator.debug_assert_paint();
+        #[cfg(target_os = "windows")]
+        {
+            use crate::PaintSurface;
+
+            let scale_factor = self.scale_factor();
+            // Whole device pixels, as `paint_image`.
+            let bounds = bounds
+                .scale(scale_factor)
+                .map_origin(|origin| origin.floor())
+                .map_size(|size| size.ceil());
+            let content_mask = self.content_mask().scale(scale_factor);
+            self.next_frame.scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask,
+                image,
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (bounds, image);
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
