@@ -1414,7 +1414,9 @@ impl BladeRenderer {
                     texture_id,
                     sprites,
                 } => {
-                    let tex_info = self.atlas.get_texture_info(texture_id);
+                    let Some(tex_info) = self.atlas.get_texture_info(texture_id) else {
+                        continue;
+                    };
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.mono_sprites);
@@ -1437,7 +1439,9 @@ impl BladeRenderer {
                     texture_id,
                     sprites,
                 } => {
-                    let tex_info = self.atlas.get_texture_info(texture_id);
+                    let Some(tex_info) = self.atlas.get_texture_info(texture_id) else {
+                        continue;
+                    };
                     let instance_buf =
                         unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.poly_sprites);

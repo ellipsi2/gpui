@@ -71,12 +71,14 @@ impl BladeAtlas {
         lock.upload_belt.flush(sync_point);
     }
 
-    pub fn get_texture_info(&self, id: AtlasTextureId) -> BladeTextureInfo {
+    /// Returns `None` once every tile in `id` has been removed: a cached view can
+    /// still replay sprites of an image dropped since, and those are skipped.
+    pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<BladeTextureInfo> {
         let lock = self.0.lock();
-        let texture = &lock.storage[id];
-        BladeTextureInfo {
+        let texture = lock.storage.get(id)?;
+        Some(BladeTextureInfo {
             raw_view: texture.raw_view,
-        }
+        })
     }
 }
 
@@ -115,6 +117,9 @@ impl PlatformAtlas for BladeAtlas {
         if let Some(mut texture) = texture_slot.take() {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
+                // Work queued for this frame must not reach the destroyed texture.
+                lock.initializations.retain(|pending| *pending != id);
+                lock.uploads.retain(|upload| upload.id != id);
                 lock.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
@@ -297,6 +302,10 @@ impl ops::Index<AtlasTextureId> for BladeAtlasStorage {
 }
 
 impl BladeAtlasStorage {
+    fn get(&self, id: AtlasTextureId) -> Option<&BladeAtlasTexture> {
+        self[id.kind].textures.get(id.index as usize)?.as_ref()
+    }
+
     fn destroy(&mut self, gpu: &gpu::Context) {
         for mut texture in self.monochrome_textures.drain().flatten() {
             texture.destroy(gpu);
