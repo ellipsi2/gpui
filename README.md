@@ -6,6 +6,11 @@ It is not a zed checkout. GPUI 0.2.2 was published to crates.io from zed commit 
 
 The branch shares no history with zed's `main`, so a Cargo git dependency on it fetches only these sources.
 
+## Changes from 0.2.2
+
+- **Windows renders through Blade (Vulkan)** instead of the DirectX 11 renderer, so Draw's renderer features are written once in WGSL. Direct3D 11 remains only to present: Blade draws each frame into a D3D11 texture shared with Vulkan, which a premultiplied DXGI composition swap chain shows through DirectComposition (Vulkan swapchains lose per-pixel window alpha on NVIDIA). See `crates/gpui/src/platform/windows/composition.rs` and Draw's `docs/design/gpui-vulkan.md`.
+- **`crates/blade-graphics`** is blade-graphics 0.7.1 (MIT, kvark/blade `88b6c64`), vendored unchanged in its own commit and then patched: D3D11 shared-texture import, the adapter LUID, and no destroy of a null swapchain (faults in NVIDIA's Windows driver).
+
 ## Crates
 
 | Directory | Package |
@@ -22,6 +27,7 @@ The branch shares no history with zed's `main`, so a Cargo git dependency on it 
 | `crates/gpui_sum_tree` | `gpui_sum_tree` |
 | `crates/gpui_util` | `gpui_util` |
 | `crates/gpui_util_macros` | `gpui_util_macros` |
+| `crates/blade-graphics` | `blade-graphics` |
 
 Each crate keeps its published `Cargo.toml`, `Cargo.toml.orig`, `.cargo_vcs_info.json` and `Cargo.lock`. The root `Cargo.toml` is a workspace that patches the crates onto each other, so `cargo check` here builds the local copies.
 
@@ -32,7 +38,7 @@ Draw's root `Cargo.toml` replaces the crates.io packages with this branch:
 ```toml
 [patch.crates-io]
 gpui = { git = "https://github.com/ellipsi2/gpui", branch = "draw" }
-# ... one line per package above
+# ... one line per package above, blade-graphics included
 ```
 
 After pushing here, run `cargo update -p gpui` (and the other packages) in Draw to move its lock file to the new commit.
