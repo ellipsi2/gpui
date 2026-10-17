@@ -534,9 +534,10 @@ pub struct BladeRenderer {
 struct ExternalImport {
     source: std::sync::Weak<dyn std::any::Any + Send + Sync>,
     texture: Option<(gpu::Texture, gpu::TextureView)>,
-    /// The `in_use` address of the frame last acquired: each new frame of the source was
-    /// released by the exporter and is acquired once.
-    frame: usize,
+    /// The `in_use` of the frame last acquired: each new frame of the source was released by
+    /// the exporter and is acquired once. Held weakly, so its address is not reused while it is
+    /// compared, and the exporter still learns when the frame is no longer shown.
+    frame: std::sync::Weak<dyn std::any::Any + Send + Sync>,
 }
 
 impl BladeRenderer {
@@ -962,11 +963,11 @@ impl BladeRenderer {
         for surface in &scene.surfaces {
             let image = &surface.image;
             let key = external_key(image);
-            let frame = Arc::as_ptr(&image.in_use) as *const () as usize;
+            let frame = Arc::downgrade(&image.in_use);
             let family = self.gpu.queue_family_index();
             if let Some(import) = self.external_images.get_mut(&key) {
                 if let Some((texture, _)) = import.texture
-                    && import.frame != frame
+                    && !import.frame.ptr_eq(&frame)
                 {
                     self.command_encoder
                         .acquire_external_texture(texture, family);
