@@ -315,6 +315,7 @@ impl BladePipelines {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct BladeSurfaceConfig {
     pub size: gpu::Extent,
     pub transparent: bool,
@@ -324,9 +325,38 @@ pub struct BladeSurfaceConfig {
 // so that they are shared between windows. E.g. `pipelines`.
 // But that is complicated by the fact that pipelines depend on
 // the format and alpha mode.
+/// Where frames go: a window surface, or on Windows a texture shared with the compositor
+/// (the window presents it through DirectComposition, which keeps per-pixel alpha).
+enum FrameTarget {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    Surface(gpu::Surface),
+    #[cfg(target_os = "windows")]
+    Shared {
+        texture: gpu::Texture,
+        view: gpu::TextureView,
+    },
+}
+
+impl FrameTarget {
+    fn info(&self) -> gpu::SurfaceInfo {
+        match self {
+            Self::Surface(surface) => surface.info(),
+            #[cfg(target_os = "windows")]
+            Self::Shared { .. } => gpu::SurfaceInfo {
+                format: SHARED_FORMAT,
+                alpha: gpu::AlphaMode::PreMultiplied,
+            },
+        }
+    }
+}
+
+/// The format of a shared frame texture (`DXGI_FORMAT_B8G8R8A8_UNORM` on the other side).
+#[cfg(target_os = "windows")]
+const SHARED_FORMAT: gpu::TextureFormat = gpu::TextureFormat::Bgra8Unorm;
+
 pub struct BladeRenderer {
     gpu: Arc<gpu::Context>,
-    surface: gpu::Surface,
+    target: FrameTarget,
     surface_config: gpu::SurfaceConfig,
     command_encoder: gpu::CommandEncoder,
     last_sync_point: Option<gpu::SyncPoint>,
@@ -344,6 +374,7 @@ pub struct BladeRenderer {
 }
 
 impl BladeRenderer {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn new<I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle>(
         context: &BladeContext,
         window: &I,
@@ -361,7 +392,63 @@ impl BladeRenderer {
             .gpu
             .create_surface_configured(window, surface_config)
             .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?;
+        Ok(Self::with_target(
+            context,
+            FrameTarget::Surface(surface),
+            surface_config,
+        ))
+    }
 
+    /// A renderer drawing into the Direct3D 11 texture behind `handle` (an NT handle of a
+    /// `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` texture of `size`, `SHARED_FORMAT`). Each `draw`
+    /// returns once the frame is complete in the texture.
+    #[cfg(target_os = "windows")]
+    pub fn new_shared(context: &BladeContext, size: gpu::Extent, handle: isize) -> Self {
+        let (texture, view) = import_shared_texture(&context.gpu, size, handle);
+        let surface_config = gpu::SurfaceConfig {
+            size,
+            usage: gpu::TextureUsage::TARGET,
+            display_sync: gpu::DisplaySync::Recent,
+            color_space: gpu::ColorSpace::Srgb,
+            allow_exclusive_full_screen: false,
+            transparent: true,
+        };
+        Self::with_target(
+            context,
+            FrameTarget::Shared { texture, view },
+            surface_config,
+        )
+    }
+
+    /// Draw into a new shared texture (see `new_shared`), as after a resize.
+    #[cfg(target_os = "windows")]
+    pub fn set_shared_target(&mut self, size: gpu::Extent, handle: isize) {
+        self.wait_for_gpu();
+        let (texture, view) = import_shared_texture(&self.gpu, size, handle);
+        if let FrameTarget::Shared {
+            texture: old_texture,
+            view: old_view,
+        } = std::mem::replace(&mut self.target, FrameTarget::Shared { texture, view })
+        {
+            self.gpu.destroy_texture_view(old_view);
+            self.gpu.destroy_texture(old_texture);
+        }
+        self.surface_config.size = size;
+        self.recreate_intermediate_textures(size);
+    }
+
+    /// Wait until the last frame is complete.
+    #[cfg(target_os = "windows")]
+    pub fn wait_for_frame(&mut self) {
+        self.wait_for_gpu();
+    }
+
+    fn with_target(
+        context: &BladeContext,
+        target: FrameTarget,
+        surface_config: gpu::SurfaceConfig,
+    ) -> Self {
+        let config = &surface_config;
         let command_encoder = context.gpu.create_command_encoder(gpu::CommandEncoderDesc {
             name: "main",
             buffer_count: 2,
@@ -369,7 +456,7 @@ impl BladeRenderer {
         let rendering_parameters = RenderingParameters::from_env(context);
         let pipelines = BladePipelines::new(
             &context.gpu,
-            surface.info(),
+            target.info(),
             rendering_parameters.path_sample_count,
         );
         let instance_belt = BufferBelt::new(BufferBeltDescriptor {
@@ -388,14 +475,14 @@ impl BladeRenderer {
         let (path_intermediate_texture, path_intermediate_texture_view) =
             create_path_intermediate_texture(
                 &context.gpu,
-                surface.info().format,
+                target.info().format,
                 config.size.width,
                 config.size.height,
             );
         let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
             create_msaa_texture_if_needed(
                 &context.gpu,
-                surface.info().format,
+                target.info().format,
                 config.size.width,
                 config.size.height,
                 rendering_parameters.path_sample_count,
@@ -410,9 +497,9 @@ impl BladeRenderer {
             .unwrap()
         };
 
-        Ok(Self {
+        Self {
             gpu: Arc::clone(&context.gpu),
-            surface,
+            target,
             surface_config,
             command_encoder,
             last_sync_point: None,
@@ -427,7 +514,7 @@ impl BladeRenderer {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
             rendering_parameters,
-        })
+        }
     }
 
     fn wait_for_gpu(&mut self) {
@@ -452,6 +539,7 @@ impl BladeRenderer {
         }
     }
 
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         self.update_drawable_size_impl(size, false);
     }
@@ -460,13 +548,19 @@ impl BladeRenderer {
     /// cases like restoring a window from minimization where the size is the same but the
     /// renderer's swap chain needs to be recreated.
     #[cfg_attr(
-        any(target_os = "macos", target_os = "linux", target_os = "freebsd"),
+        any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "windows"
+        ),
         allow(dead_code)
     )]
     pub fn update_drawable_size_even_if_unchanged(&mut self, size: Size<DevicePixels>) {
         self.update_drawable_size_impl(size, true);
     }
 
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn update_drawable_size_impl(&mut self, size: Size<DevicePixels>, always_resize: bool) {
         let gpu_size = gpu::Extent {
             width: size.width.0 as u32,
@@ -477,50 +571,61 @@ impl BladeRenderer {
         if always_resize || gpu_size != self.surface_config.size {
             self.wait_for_gpu();
             self.surface_config.size = gpu_size;
-            self.gpu
-                .reconfigure_surface(&mut self.surface, self.surface_config);
-            self.gpu.destroy_texture(self.path_intermediate_texture);
-            self.gpu
-                .destroy_texture_view(self.path_intermediate_texture_view);
-            if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
-                self.gpu.destroy_texture(msaa_texture);
+            if let FrameTarget::Surface(surface) = &mut self.target {
+                self.gpu.reconfigure_surface(surface, self.surface_config);
             }
-            if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
-                self.gpu.destroy_texture_view(msaa_view);
-            }
-            let (path_intermediate_texture, path_intermediate_texture_view) =
-                create_path_intermediate_texture(
-                    &self.gpu,
-                    self.surface.info().format,
-                    gpu_size.width,
-                    gpu_size.height,
-                );
-            self.path_intermediate_texture = path_intermediate_texture;
-            self.path_intermediate_texture_view = path_intermediate_texture_view;
-            let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
-                create_msaa_texture_if_needed(
-                    &self.gpu,
-                    self.surface.info().format,
-                    gpu_size.width,
-                    gpu_size.height,
-                    self.rendering_parameters.path_sample_count,
-                )
-                .unzip();
-            self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-            self.path_intermediate_msaa_texture_view = path_intermediate_msaa_texture_view;
+            self.recreate_intermediate_textures(gpu_size);
         }
     }
 
+    fn recreate_intermediate_textures(&mut self, gpu_size: gpu::Extent) {
+        self.gpu.destroy_texture(self.path_intermediate_texture);
+        self.gpu
+            .destroy_texture_view(self.path_intermediate_texture_view);
+        if let Some(msaa_texture) = self.path_intermediate_msaa_texture {
+            self.gpu.destroy_texture(msaa_texture);
+        }
+        if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
+            self.gpu.destroy_texture_view(msaa_view);
+        }
+        let (path_intermediate_texture, path_intermediate_texture_view) =
+            create_path_intermediate_texture(
+                &self.gpu,
+                self.target.info().format,
+                gpu_size.width,
+                gpu_size.height,
+            );
+        self.path_intermediate_texture = path_intermediate_texture;
+        self.path_intermediate_texture_view = path_intermediate_texture_view;
+        let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
+            create_msaa_texture_if_needed(
+                &self.gpu,
+                self.target.info().format,
+                gpu_size.width,
+                gpu_size.height,
+                self.rendering_parameters.path_sample_count,
+            )
+            .unzip();
+        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
+        self.path_intermediate_msaa_texture_view = path_intermediate_msaa_texture_view;
+    }
+
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn update_transparency(&mut self, transparent: bool) {
+        // A shared target is always premultiplied: the compositor keeps its alpha.
+        if !matches!(self.target, FrameTarget::Surface(_)) {
+            return;
+        }
         if transparent != self.surface_config.transparent {
             self.wait_for_gpu();
             self.surface_config.transparent = transparent;
-            self.gpu
-                .reconfigure_surface(&mut self.surface, self.surface_config);
+            if let FrameTarget::Surface(surface) = &mut self.target {
+                self.gpu.reconfigure_surface(surface, self.surface_config);
+            }
             self.pipelines.destroy(&self.gpu);
             self.pipelines = BladePipelines::new(
                 &self.gpu,
-                self.surface.info(),
+                self.target.info(),
                 self.rendering_parameters.path_sample_count,
             );
         }
@@ -557,7 +662,8 @@ impl BladeRenderer {
 
     #[cfg(target_os = "macos")]
     pub fn layer_ptr(&self) -> *mut metal::CAMetalLayer {
-        objc2::rc::Retained::as_ptr(&self.surface.metal_layer()) as *mut _
+        let FrameTarget::Surface(surface) = &self.target;
+        objc2::rc::Retained::as_ptr(&surface.metal_layer()) as *mut _
     }
 
     #[profiling::function]
@@ -628,7 +734,14 @@ impl BladeRenderer {
         self.instance_belt.destroy(&self.gpu);
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
         self.pipelines.destroy(&self.gpu);
-        self.gpu.destroy_surface(&mut self.surface);
+        match &mut self.target {
+            FrameTarget::Surface(surface) => self.gpu.destroy_surface(surface),
+            #[cfg(target_os = "windows")]
+            FrameTarget::Shared { texture, view } => {
+                self.gpu.destroy_texture_view(*view);
+                self.gpu.destroy_texture(*texture);
+            }
+        }
         self.gpu.destroy_texture(self.path_intermediate_texture);
         self.gpu
             .destroy_texture_view(self.path_intermediate_texture_view);
@@ -644,18 +757,24 @@ impl BladeRenderer {
         self.command_encoder.start();
         self.atlas.before_frame(&mut self.command_encoder);
 
-        let frame = {
-            profiling::scope!("acquire frame");
-            self.surface.acquire_frame()
+        let (frame, frame_texture, frame_view) = match &mut self.target {
+            FrameTarget::Surface(surface) => {
+                profiling::scope!("acquire frame");
+                let frame = surface.acquire_frame();
+                let (texture, view) = (frame.texture(), frame.texture_view());
+                (Some(frame), texture, view)
+            }
+            #[cfg(target_os = "windows")]
+            FrameTarget::Shared { texture, view } => (None, *texture, *view),
         };
-        self.command_encoder.init_texture(frame.texture());
+        self.command_encoder.init_texture(frame_texture);
 
         let globals = GlobalParams {
             viewport_size: [
                 self.surface_config.size.width as f32,
                 self.surface_config.size.height as f32,
             ],
-            premultiplied_alpha: match self.surface.info().alpha {
+            premultiplied_alpha: match self.target.info().alpha {
                 gpu::AlphaMode::Ignored | gpu::AlphaMode::PostMultiplied => 0,
                 gpu::AlphaMode::PreMultiplied => 1,
             },
@@ -666,7 +785,7 @@ impl BladeRenderer {
             "main",
             gpu::RenderTargetSet {
                 colors: &[gpu::RenderTarget {
-                    view: frame.texture_view(),
+                    view: frame_view,
                     init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
                     finish_op: gpu::FinishOp::Store,
                 }],
@@ -716,7 +835,7 @@ impl BladeRenderer {
                         "main",
                         gpu::RenderTargetSet {
                             colors: &[gpu::RenderTarget {
-                                view: frame.texture_view(),
+                                view: frame_view,
                                 init_op: gpu::InitOp::Load,
                                 finish_op: gpu::FinishOp::Store,
                             }],
@@ -906,7 +1025,9 @@ impl BladeRenderer {
         }
         drop(pass);
 
-        self.command_encoder.present(frame);
+        if let Some(frame) = frame {
+            self.command_encoder.present(frame);
+        }
         let sync_point = self.gpu.submit(&mut self.command_encoder);
 
         profiling::scope!("finish");
@@ -915,7 +1036,44 @@ impl BladeRenderer {
 
         self.wait_for_gpu();
         self.last_sync_point = Some(sync_point);
+        // The compositor reads a shared target as soon as `draw` returns.
+        // ponytail: a CPU wait per frame; a shared fence or keyed mutex would overlap the
+        // copy with the next frame if the wait shows up in profiles.
+        #[cfg(target_os = "windows")]
+        if matches!(self.target, FrameTarget::Shared { .. }) {
+            self.wait_for_gpu();
+        }
     }
+}
+
+/// Import the shared Direct3D 11 frame texture behind `handle` as a render target.
+#[cfg(target_os = "windows")]
+fn import_shared_texture(
+    gpu: &gpu::Context,
+    size: gpu::Extent,
+    handle: isize,
+) -> (gpu::Texture, gpu::TextureView) {
+    let texture = gpu.create_texture(gpu::TextureDesc {
+        name: "shared frame",
+        format: SHARED_FORMAT,
+        size,
+        array_layer_count: 1,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: gpu::TextureDimension::D2,
+        usage: gpu::TextureUsage::TARGET,
+        external: Some(gpu::ExternalMemorySource::D3D11Texture(handle)),
+    });
+    let view = gpu.create_texture_view(
+        texture,
+        gpu::TextureViewDesc {
+            name: "shared frame view",
+            format: SHARED_FORMAT,
+            dimension: gpu::ViewDimension::D2,
+            subresources: &Default::default(),
+        },
+    );
+    (texture, view)
 }
 
 fn create_path_intermediate_texture(

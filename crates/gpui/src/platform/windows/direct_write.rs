@@ -113,7 +113,6 @@ impl DirectWriteTextSystem {
             font_id_by_identifier: HashMap::default(),
         })))
     }
-
 }
 
 impl PlatformTextSystem for DirectWriteTextSystem {
@@ -929,7 +928,6 @@ impl DirectWriteState {
         ));
         result
     }
-
 }
 
 impl Drop for DirectWriteState {
@@ -960,7 +958,8 @@ fn composite_color_layers(layers: &[GlyphLayer], width: usize, height: usize) ->
     let mut premultiplied = vec![[0f32; 4]; width * height];
     for layer in layers {
         let color = [layer.run_color.b, layer.run_color.g, layer.run_color.r];
-        let brightness = 0.30 * layer.run_color.r + 0.59 * layer.run_color.g + 0.11 * layer.run_color.b;
+        let brightness =
+            0.30 * layer.run_color.r + 0.59 * layer.run_color.g + 0.11 * layer.run_color.b;
         let k = enhanced_contrast * (4.0 * (0.75 - brightness)).clamp(0.0, 1.0);
         let (layer_width, layer_height) = (layer.bounds.size.width, layer.bounds.size.height);
         for ly in 0..layer_height {
@@ -976,7 +975,8 @@ fn composite_color_layers(layers: &[GlyphLayer], width: usize, height: usize) ->
                 let sample = f32::from(layer.alpha[(ly * layer_width + lx) as usize]) / 255.0;
                 let contrasted = sample * (k + 1.0) / (sample * k + 1.0);
                 let g = gamma_ratios;
-                let correction = (g[0] * brightness + g[1]) * contrasted + (g[2] * brightness + g[3]);
+                let correction =
+                    (g[0] * brightness + g[1]) * contrasted + (g[2] * brightness + g[3]);
                 let corrected = contrasted + contrasted * (1.0 - contrasted) * correction;
                 let alpha = (corrected * layer.run_color.a).clamp(0.0, 1.0);
                 let dst = &mut premultiplied[y as usize * width + x as usize];

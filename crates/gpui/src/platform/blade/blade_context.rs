@@ -34,6 +34,13 @@ impl BladeContext {
         );
         Ok(Self { gpu })
     }
+
+    /// The locally unique identifier of the adapter Vulkan renders on, when the driver reports
+    /// one, to find the same adapter through another API.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn adapter_luid(&self) -> Option<[u8; 8]> {
+        self.gpu.device_information().luid
+    }
 }
 
 fn parse_pci_id(id: &str) -> anyhow::Result<u32> {

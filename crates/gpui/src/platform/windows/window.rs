@@ -26,10 +26,7 @@ use windows::{
     core::*,
 };
 
-use crate::{
-    platform::blade::{BladeContext, BladeRenderer},
-    *,
-};
+use crate::{platform::blade::BladeContext, *};
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
@@ -53,7 +50,7 @@ pub struct WindowsWindowState {
 
     /// Created once `CreateWindowExW` returns: during creation the client area is empty, and
     /// Vulkan cannot make a swap chain for it.
-    pub renderer: Option<BladeRenderer>,
+    pub renderer: Option<windows_renderer::WindowRenderer>,
 
     pub click_state: ClickState,
     pub current_cursor: Option<HCURSOR>,
@@ -404,6 +401,8 @@ impl WindowsWindow {
 
             (WS_EX_APPWINDOW, dwstyle)
         };
+        // Frames are shown through DirectComposition (see `composition`).
+        let dwexstyle = dwexstyle | WS_EX_NOREDIRECTIONBITMAP;
 
         let hinstance = get_module_handle();
         let display = if let Some(display_id) = params.display_id {
@@ -455,14 +454,16 @@ impl WindowsWindow {
         let client = {
             let mut rect = RECT::default();
             unsafe { GetClientRect(hwnd, &mut rect)? };
-            blade_graphics::Extent {
-                width: (rect.right - rect.left).max(1) as u32,
-                height: (rect.bottom - rect.top).max(1) as u32,
-                depth: 1,
-            }
+            size(
+                DevicePixels(rect.right - rect.left),
+                DevicePixels(rect.bottom - rect.top),
+            )
         };
-        this.state.borrow_mut().renderer =
-            Some(windows_renderer::init(&context.gpu_context, hwnd, client, true)?);
+        this.state.borrow_mut().renderer = Some(
+            windows_renderer::WindowRenderer::new(&context.gpu_context, hwnd, client).inspect_err(
+                |err| show_error("Failed to initialize the renderer", err.to_string()),
+            )?,
+        );
 
         register_drag_drop(&this)?;
         configure_dwm_dark_mode(hwnd, appearance);
@@ -766,9 +767,6 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let hwnd = self.0.hwnd;
-        if let Some(renderer) = self.0.state.borrow_mut().renderer.as_mut() {
-            renderer.update_transparency(background_appearance != WindowBackgroundAppearance::Opaque);
-        }
 
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
@@ -866,6 +864,7 @@ impl PlatformWindow for WindowsWindow {
             .renderer
             .as_ref()
             .expect("renderer is created with the window")
+            .renderer
             .sprite_atlas()
             .clone()
     }
@@ -875,7 +874,15 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        Some(self.0.state.borrow().renderer.as_ref()?.gpu_specs())
+        Some(
+            self.0
+                .state
+                .borrow()
+                .renderer
+                .as_ref()?
+                .renderer
+                .gpu_specs(),
+        )
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -1380,46 +1387,86 @@ fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32
 }
 
 mod windows_renderer {
-    use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
-    use raw_window_handle as rwh;
-    use std::num::NonZeroIsize;
-    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::GWLP_HINSTANCE};
+    use anyhow::Result;
+    use util::ResultExt as _;
+    use windows::Win32::Foundation::HWND;
 
-    use crate::{get_window_long, show_error};
+    use crate::{
+        CompositionPresenter, DevicePixels, Scene, Size,
+        platform::blade::{BladeContext, BladeRenderer},
+    };
 
-    pub(super) fn init(
-        context: &BladeContext,
-        hwnd: HWND,
-        size: blade_graphics::Extent,
-        transparent: bool,
-    ) -> anyhow::Result<BladeRenderer> {
-        let raw = RawWindow { hwnd };
-        let config = BladeSurfaceConfig { size, transparent,
-        };
-        BladeRenderer::new(context, &raw, config)
-            .inspect_err(|err| show_error("Failed to initialize BladeRenderer", err.to_string()))
+    /// The Vulkan renderer and the presenter that shows its frames.
+    pub(crate) struct WindowRenderer {
+        pub(crate) renderer: BladeRenderer,
+        presenter: CompositionPresenter,
+        size: Size<DevicePixels>,
     }
 
-    struct RawWindow {
-        hwnd: HWND,
-    }
-
-    impl rwh::HasWindowHandle for RawWindow {
-        fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-            Ok(unsafe {
-                let hwnd = NonZeroIsize::new_unchecked(self.hwnd.0 as isize);
-                let mut handle = rwh::Win32WindowHandle::new(hwnd);
-                let hinstance = get_window_long(self.hwnd, GWLP_HINSTANCE);
-                handle.hinstance = NonZeroIsize::new(hinstance);
-                rwh::WindowHandle::borrow_raw(handle.into())
+    impl WindowRenderer {
+        pub(crate) fn new(
+            context: &BladeContext,
+            hwnd: HWND,
+            size: Size<DevicePixels>,
+        ) -> Result<Self> {
+            let size = clamp(size);
+            let presenter = CompositionPresenter::new(
+                hwnd,
+                context.adapter_luid(),
+                size.width.0 as u32,
+                size.height.0 as u32,
+            )?;
+            let renderer =
+                BladeRenderer::new_shared(context, extent(size), presenter.shared_handle());
+            Ok(Self {
+                renderer,
+                presenter,
+                size,
             })
+        }
+
+        pub(crate) fn draw(&mut self, scene: &Scene) {
+            self.renderer.draw(scene);
+            self.presenter.present().log_err();
+        }
+
+        pub(crate) fn resize(&mut self, size: Size<DevicePixels>) {
+            let size = clamp(size);
+            if size == self.size {
+                return;
+            }
+            self.size = size;
+            // The renderer stops using the old texture before the presenter replaces it.
+            self.renderer.wait_for_frame();
+            if self
+                .presenter
+                .resize(size.width.0 as u32, size.height.0 as u32)
+                .log_err()
+                .is_some()
+            {
+                self.renderer
+                    .set_shared_target(extent(size), self.presenter.shared_handle());
+            }
+        }
+
+        pub(crate) fn destroy(&mut self) {
+            self.renderer.destroy();
         }
     }
 
-    impl rwh::HasDisplayHandle for RawWindow {
-        fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-            let handle = rwh::WindowsDisplayHandle::new();
-            Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
+    /// Neither API accepts an empty frame.
+    fn clamp(size: Size<DevicePixels>) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(size.width.0.max(1)),
+            height: DevicePixels(size.height.0.max(1)),
+        }
+    }
+
+    fn extent(size: Size<DevicePixels>) -> blade_graphics::Extent {
+        blade_graphics::Extent {
+            width: size.width.0 as u32,
+            height: size.height.0 as u32,
+            depth: 1,
         }
     }
 }

@@ -182,10 +182,6 @@ impl WindowsWindowInner {
         let scale_factor = lock.scale_factor;
         let mut should_resize_renderer = false;
         if lock.restore_from_minimized.is_some() {
-            // The swap chain is recreated after a minimize, even at an unchanged size.
-            if let Some(renderer) = lock.renderer.as_mut() {
-                renderer.update_drawable_size_even_if_unchanged(new_size);
-            }
             lock.callbacks.request_frame = lock.restore_from_minimized.take();
         } else {
             should_resize_renderer = true;
@@ -207,7 +203,7 @@ impl WindowsWindowInner {
         lock.logical_size = new_logical_size;
         if should_resize_renderer {
             if let Some(renderer) = lock.renderer.as_mut() {
-                renderer.update_drawable_size(device_size);
+                renderer.resize(device_size);
             }
         }
         if let Some(mut callback) = lock.callbacks.resize.take() {

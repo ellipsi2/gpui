@@ -99,10 +99,8 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
-        let text_system = Arc::new(
-            DirectWriteTextSystem::new()
-                .context("Error creating DirectWriteTextSystem")?,
-        );
+        let text_system =
+            Arc::new(DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?);
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
             inner: None,
@@ -762,7 +760,6 @@ impl WindowsPlatformInner {
         self.state.borrow_mut().callbacks.keyboard_layout_change = Some(callback);
         Some(0)
     }
-
 }
 
 impl Drop for WindowsPlatform {
