@@ -229,23 +229,37 @@ impl DirectWriteState {
         }
         unsafe {
             let builder = self.components.factory.CreateFontFallbackBuilder()?;
-            let font_set = &self.system_font_collection.GetFontSet()?;
             for family_name in fallbacks.fallback_list() {
-                let Some(fonts) = font_set
-                    .GetMatchingFonts(
-                        &HSTRING::from(family_name),
-                        DWRITE_FONT_WEIGHT_NORMAL,
-                        DWRITE_FONT_STRETCH_NORMAL,
-                        DWRITE_FONT_STYLE_NORMAL,
-                    )
-                    .log_err()
-                else {
-                    continue;
-                };
-                if fonts.GetFontCount() == 0 {
+                // Fonts added with `add_fonts` first, like `find_font_id`; their mapping names
+                // the custom collection, the system collection's mapping names none.
+                let mut found = None;
+                for (collection, is_custom) in [
+                    (&self.custom_font_collection, true),
+                    (&self.system_font_collection, false),
+                ] {
+                    let Some(fonts) = collection
+                        .GetFontSet()
+                        .and_then(|set| {
+                            set.GetMatchingFonts(
+                                &HSTRING::from(family_name),
+                                DWRITE_FONT_WEIGHT_NORMAL,
+                                DWRITE_FONT_STRETCH_NORMAL,
+                                DWRITE_FONT_STYLE_NORMAL,
+                            )
+                        })
+                        .log_err()
+                    else {
+                        continue;
+                    };
+                    if fonts.GetFontCount() > 0 {
+                        found = Some((fonts, is_custom.then_some(&**collection)));
+                        break;
+                    }
+                }
+                let Some((fonts, collection)) = found else {
                     log::error!("No matching font found for {}", family_name);
                     continue;
-                }
+                };
                 let font = fonts.GetFontFaceReference(0)?.CreateFontFace()?;
                 let mut count = 0;
                 font.GetUnicodeRanges(None, &mut count).ok();
@@ -263,7 +277,7 @@ impl DirectWriteState {
                 builder.AddMapping(
                     &unicode_ranges,
                     &[target_family_name.as_ptr()],
-                    None,
+                    collection,
                     None,
                     None,
                     1.0,
