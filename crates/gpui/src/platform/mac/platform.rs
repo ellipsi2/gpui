@@ -1038,6 +1038,7 @@ impl Platform for MacPlatform {
                         ClipboardEntry::Image(image) => {
                             self.write_image_to_clipboard(image);
                         }
+                        ClipboardEntry::ExternalPaths(_) => {}
                     },
                     None => {
                         // Writing an empty list of entries just clears the clipboard.
@@ -1103,8 +1104,18 @@ impl Platform for MacPlatform {
         let state = self.0.lock();
         let pasteboard = state.pasteboard;
 
-        // First, see if it's a string.
         unsafe {
+            // Files copied in Finder also offer their names as a string: see if they are files
+            // first.
+            if let Some(paths) = super::window::external_paths_from_pasteboard(pasteboard)
+                && !paths.paths().is_empty()
+            {
+                return Some(ClipboardItem {
+                    entries: vec![ClipboardEntry::ExternalPaths(paths)],
+                });
+            }
+
+            // Then see if it's a string.
             let types: id = pasteboard.types();
             let string_type: id = ns_string("public.utf8-plain-text");
 

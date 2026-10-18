@@ -2409,8 +2409,13 @@ extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -
 }
 
 fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
-    let mut paths = SmallVec::new();
     let pasteboard: id = unsafe { msg_send![dragging_info, draggingPasteboard] };
+    external_paths_from_pasteboard(pasteboard)
+}
+
+/// The file paths on `pasteboard` (files dragged, or copied in Finder).
+pub(crate) fn external_paths_from_pasteboard(pasteboard: id) -> Option<ExternalPaths> {
+    let mut paths = SmallVec::new();
     let filenames = unsafe { NSPasteboard::propertyListForType(pasteboard, NSFilenamesPboardType) };
     if filenames == nil {
         return None;
